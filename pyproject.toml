@@ -1,0 +1,11 @@
+[project]
+name = "chainflip-tg-bot"
+version = "0.1.0"
+description = "Chainflip Telegram Validator Monitor"
+license = {text = "GPL-3.0-or-later"}
+requires-python = ">=3.11"
+dependencies = [
+    "python-telegram-bot>=22",
+    "substrate-interface",
+    "requests",
+]

@@ -1,0 +1,21 @@
+[chainflip]
+node_endpoint = "http://127.0.0.1:9944"
+
+[telegram]
+bot_token = ""
+
+[database]
+# Path to SQLite database (default: monitor_validators.db next to config file)
+#path = "/var/lib/chainflip-tg-bot/monitor_validators.db"
+
+[monitoring]
+# How often to poll the node (seconds)
+poll_interval_seconds = 30
+# How often to re-send persistent CRITICAL alerts (seconds)
+reminder_interval_seconds = 7200
+
+[emoji]
+ok       = "🟢"
+warning  = "🟡"
+alert    = "🟠"
+critical = "🔴"
