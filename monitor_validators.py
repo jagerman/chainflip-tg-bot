@@ -516,10 +516,15 @@ def run_poll(app, conn, api, reminder_interval):
         for severity, msg in agg_alerts:
             chat_alerts.append((severity, None, None, msg))
 
+        # Determine the actual current severity by examining stored alert state,
+        # not just whether any transitions happened this poll.
+        current_severity = _current_severity(conn, chat_id, operator)
+
         if not chat_alerts:
-            # No alerts this poll — check if we transitioned back to ok
+            # Nothing transitioned this poll — only send "All good" if the
+            # stored state is actually clear AND we haven't already said so.
             prev_severity = _get_last_severity(conn, chat_id, operator)
-            if prev_severity != 'ok':
+            if current_severity == 'ok' and prev_severity != 'ok':
                 _set_last_severity(conn, chat_id, operator, 'ok')
                 msg = f'{e("ok")} <b>All good</b> — {op_link(operator, vanity_map)}: all validators healthy (block {current_block}, {relative_time(block_timestamp)})'
                 asyncio.run_coroutine_threadsafe(
@@ -531,7 +536,7 @@ def run_poll(app, conn, api, reminder_interval):
                 )
             continue
 
-        global_severity = worst(*[s for s, _, _, _ in chat_alerts])
+        global_severity = worst(current_severity, *[s for s, _, _, _ in chat_alerts])
         _set_last_severity(conn, chat_id, operator, global_severity)
 
         lines = [f'{e(global_severity)} <b>Chainflip Alert</b> — {op_link(operator, vanity_map)} (block {current_block}, {relative_time(block_timestamp)})\n']
@@ -552,6 +557,34 @@ def run_poll(app, conn, api, reminder_interval):
             ),
             app.bot_data['loop'],
         )
+
+def _current_severity(conn, chat_id, operator):
+    """Determine the current severity from stored alert state (not transitions)."""
+    severity = 'ok'
+    val_rows = conn.execute(
+        '''SELECT alert_offline, alert_warning, alert_alert, alert_critical
+           FROM validator_state WHERE chat_id=? AND operator=?''',
+        (chat_id, operator)
+    ).fetchall()
+    for row in val_rows:
+        if row['alert_offline'] or row['alert_critical']:
+            return 'critical'
+        if row['alert_alert']:
+            severity = worst(severity, 'alert')
+        elif row['alert_warning']:
+            severity = worst(severity, 'warning')
+
+    op_row = conn.execute(
+        'SELECT alert_alert_agg, alert_critical_agg FROM operator_state WHERE chat_id=? AND operator=?',
+        (chat_id, operator)
+    ).fetchone()
+    if op_row:
+        if op_row['alert_critical_agg']:
+            return 'critical'
+        if op_row['alert_alert_agg']:
+            severity = worst(severity, 'alert')
+
+    return severity
 
 def _get_last_severity(conn, chat_id, operator):
     row = conn.execute(
