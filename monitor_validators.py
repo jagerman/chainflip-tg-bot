@@ -44,6 +44,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from telegram.constants import ParseMode
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logging.getLogger('httpx').setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
