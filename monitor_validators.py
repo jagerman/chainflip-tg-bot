@@ -36,7 +36,9 @@ import sys
 import time
 import tomllib
 from pathlib import Path
+from eth_utils import is_address, to_checksum_address
 from substrateinterface import SubstrateInterface
+from scalecodec.utils.ss58 import ss58_encode
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 from telegram.constants import ParseMode
@@ -60,6 +62,9 @@ DROPS_CRITICAL = 1
 
 SCAN_VALIDATOR = 'https://scan.chainflip.io/validators'
 SCAN_OPERATOR  = 'https://scan.chainflip.io/operators'
+
+# Chainflip SS58 prefix; ETH-derived accounts are 12 zero bytes + 20-byte address.
+CHAINFLIP_SS58_PREFIX = 2112
 
 # Severity levels in ascending order — populated from config at startup
 EMOJI = {}  # ok / warning / alert / critical -> str
@@ -89,6 +94,25 @@ def relative_time(timestamp):
 def short_addr(addr):
     """Abbreviate a Chainflip address to a consistent short form."""
     return f'{addr[:6]}…{addr[-4:]}'
+
+def parse_eth_addr(s):
+    """Parse a 0x… ETH address string into 20 raw bytes; return None if invalid."""
+    s = s.strip()
+    if not is_address(s):
+        return None
+    return bytes.fromhex(s[2:].lower())
+
+def eth_to_ss58(raw):
+    """Convert 20 raw ETH address bytes to the on-chain Chainflip SS58 (cF…) form."""
+    return ss58_encode(b'\x00' * 12 + raw, ss58_format=CHAINFLIP_SS58_PREFIX)
+
+def wallet_display(raw):
+    """EIP-55 checksummed 0x… display form for 20 raw bytes."""
+    return to_checksum_address(raw)
+
+def wallet_short(raw):
+    c = wallet_display(raw)
+    return f'{c[:6]}…{c[-4:]}'
 
 def op_link(operator, vanity_map=None):
     """Return operator display with a clickable abbreviated address link."""
@@ -135,6 +159,13 @@ def db_connect(path):
             last_reminder      REAL    DEFAULT 0,
             PRIMARY KEY (chat_id, operator)
         );
+
+        CREATE TABLE IF NOT EXISTS wallets (
+            chat_id  INTEGER,
+            wallet   BLOB,     -- 20 raw bytes of ETH address
+            label    TEXT,
+            PRIMARY KEY (chat_id, wallet)
+        );
     ''')
     conn.commit()
     return conn
@@ -164,13 +195,21 @@ def fetch_chain_data(api):
 FLIP_DECIMALS = 10**18
 
 def format_flip(amount):
-    """Format a raw FLIP amount as a human-readable string."""
+    """Format a raw FLIP amount with 3 significant digits and k/M suffix."""
     val = amount / FLIP_DECIMALS
     if val >= 1_000_000:
-        return f'{val / 1_000_000:.2f}M'
-    if val >= 1_000:
-        return f'{val / 1_000:.1f}k'
-    return f'{val:.1f}'
+        v, suffix = val / 1_000_000, 'M'
+    elif val >= 1_000:
+        v, suffix = val / 1_000, 'k'
+    else:
+        v, suffix = val, ''
+    if v >= 100:
+        return f'{v:.0f}{suffix}'
+    if v >= 10:
+        return f'{v:.1f}{suffix}'
+    if v >= 1:
+        return f'{v:.2f}{suffix}'
+    return f'{v:.3f}{suffix}'
 
 def get_operator_financials(api, operator, validators):
     """Fetch balance, total validator stake, and delegation info for an operator."""
@@ -203,6 +242,44 @@ def get_operator_financials(api, operator, validators):
 def get_managed_validators(api, operator):
     result = api.query('Validator', 'ManagedValidators', [operator])
     return list(result.value or [])
+
+def get_wallet_delegations(api, wallets, operators):
+    """
+    For each wallet (20-byte raw), look up its delegation choice and on-chain balance.
+    Returns {operator_ss58: [(wallet_raw, label, current, upcoming, reward), ...]} for
+    only those wallets whose chosen operator is in `operators`.
+    """
+    if not wallets or not operators:
+        return {}
+
+    current_epoch = api.query('Validator', 'CurrentEpoch').value
+    operators = set(operators)
+
+    snapshots = {}  # operator -> {delegator_ss58: amount}
+    out = {op: [] for op in operators}
+
+    for raw, label in wallets:
+        ss58 = eth_to_ss58(raw)
+        choice = api.query('Validator', 'DelegationChoice', [ss58]).value
+        if not choice:
+            continue
+        chosen_op, max_bid = choice
+        if chosen_op not in operators:
+            continue
+
+        if chosen_op not in snapshots:
+            snap = api.query('Validator', 'DelegationSnapshots', [current_epoch, chosen_op]).value
+            snapshots[chosen_op] = dict(snap['delegators']) if snap else {}
+
+        current = snapshots[chosen_op].get(ss58, 0)
+        acc = api.query('Flip', 'Account', [ss58]).value or {}
+        balance = acc.get('balance', 0)
+        bond    = acc.get('bond', 0)
+        reward  = max(balance - bond, 0)
+
+        out[chosen_op].append((raw, label, current, max_bid, reward))
+
+    return out
 
 def is_online(validator, current_block, all_heartbeats):
     last_hb = all_heartbeats.get(validator)
@@ -386,7 +463,19 @@ def process_operator_aggregates(conn, chat_id, operator, validator_reps, now, re
 
 # ── Status message builder ────────────────────────────────────────────────────
 
-def build_status_message_for_user(conn, chat_id, api_data, operator_validators, vanity_map, operator_financials):
+def format_wallet_line(raw, label, current, upcoming, reward):
+    """Format one wallet delegation sub-line."""
+    name = label or wallet_short(raw)
+    cur_s = format_flip(current)
+    parts = [f'{cur_s} FLIP delegated']
+    if upcoming != current:
+        parts[-1] = f'{cur_s} → {format_flip(upcoming)} FLIP delegated'
+    if reward > 0:
+        parts.append(f'+{format_flip(reward)} claimable')
+    return f'        💼 {name}: {", ".join(parts)}'
+
+def build_status_message_for_user(conn, chat_id, api_data, operator_validators, vanity_map, operator_financials, wallet_delegations=None):
+    wallet_delegations = wallet_delegations or {}
     current_block, block_timestamp, _, all_reputations, all_heartbeats, authorities, active_bidders = api_data
 
     if not operator_validators:
@@ -443,14 +532,16 @@ def build_status_message_for_user(conn, chat_id, api_data, operator_validators, 
             stake_parts.append(f'{num_bidding} 🌱 bidding')
         if num_idle:
             stake_parts.append(f'{num_idle} 💤')
-        fin_lines = (
-            f'    💰 Balance: {format_flip(fin.get("operator_balance", 0))} FLIP\n'
-            f'    ⚡ Stake: {format_flip(fin.get("total_stake", 0))} FLIP ({", ".join(stake_parts)})\n'
-            f'    🤝 Delegations: {format_flip(fin.get("total_delegation", 0))} FLIP ({fin.get("num_delegators", 0)} delegators)'
-        )
+        fin_lines = [
+            f'    💰 Balance: {format_flip(fin.get("operator_balance", 0))} FLIP',
+            f'    ⚡ Stake: {format_flip(fin.get("total_stake", 0))} FLIP ({", ".join(stake_parts)})',
+            f'    🤝 Delegations: {format_flip(fin.get("total_delegation", 0))} FLIP ({fin.get("num_delegators", 0)} delegators)',
+        ]
+        for raw, label, current, upcoming, reward in wallet_delegations.get(operator, []):
+            fin_lines.append(format_wallet_line(raw, label, current, upcoming, reward))
         sections.append(
             f'{e(op_severity)} {op_link(operator, vanity_map)}\n' +
-            f'{fin_lines}\n' +
+            '\n'.join(fin_lines) + '\n' +
             '\n'.join(val_lines)
         )
 
@@ -608,6 +699,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'Commands:\n'
         '/register &lt;operator_address&gt; — monitor an operator\n'
         '/unregister — stop monitoring an operator\n'
+        '/wallet &lt;0x… address&gt; [label] — register a delegator wallet to track\n'
+        '/unwallet — remove a registered wallet\n'
         '/status — show current validator status',
         parse_mode=ParseMode.HTML,
     )
@@ -647,10 +740,14 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await _do_register(update.message, conn, context.args[0])
 
-async def handle_register_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle a reply to the ForceReply prompt from /register."""
+async def handle_force_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route a ForceReply response back to the matching prompt's handler."""
     conn = context.bot_data['conn']
-    await _do_register(update.message, conn, update.message.text)
+    prompt = (update.message.reply_to_message.text or '') if update.message.reply_to_message else ''
+    if prompt.startswith('Please enter the wallet address'):
+        await _do_wallet_add(update.message, conn, update.message.text)
+    elif prompt.startswith('Please enter the operator address'):
+        await _do_register(update.message, conn, update.message.text)
 
 async def cmd_unregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = context.bot_data['conn']
@@ -694,6 +791,102 @@ async def callback_unregister(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await query.edit_message_text(f'✅ Unregistered operator <code>{operator}</code>.', parse_mode=ParseMode.HTML)
 
+async def _do_wallet_add(message, conn, text):
+    """Shared wallet-registration logic. `text` is the user-supplied '<addr> [label]'."""
+    chat_id = message.chat_id
+    parts = text.strip().split(maxsplit=1)
+    addr_s = parts[0] if parts else ''
+    label = parts[1].strip() if len(parts) > 1 else None
+
+    raw = parse_eth_addr(addr_s)
+    if raw is None:
+        await message.reply_text(
+            '⚠️ That doesn\'t look like a valid ETH address (should start with 0x and be 42 chars).'
+        )
+        return
+
+    existing = conn.execute(
+        'SELECT label FROM wallets WHERE chat_id=? AND wallet=?', (chat_id, raw)
+    ).fetchone()
+    if existing:
+        if label and existing['label'] != label:
+            conn.execute(
+                'UPDATE wallets SET label=? WHERE chat_id=? AND wallet=?',
+                (label, chat_id, raw),
+            )
+            conn.commit()
+            await message.reply_text(
+                f'✅ Updated label for <code>{wallet_display(raw)}</code> to <b>{label}</b>.',
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await message.reply_text(
+                f'You already have <code>{wallet_display(raw)}</code> registered.',
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    conn.execute(
+        'INSERT INTO wallets (chat_id, wallet, label) VALUES (?,?,?)',
+        (chat_id, raw, label),
+    )
+    conn.commit()
+    name = f' as <b>{label}</b>' if label else ''
+    await message.reply_text(
+        f'✅ Registered wallet <code>{wallet_display(raw)}</code>{name}.',
+        parse_mode=ParseMode.HTML,
+    )
+
+async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = context.bot_data['conn']
+    if not context.args:
+        await update.message.reply_text(
+            'Please enter the wallet address (optionally followed by a label):',
+            reply_markup=ForceReply(input_field_placeholder='0x… [label]'),
+        )
+        return
+    await _do_wallet_add(update.message, conn, ' '.join(context.args))
+
+async def cmd_unwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = context.bot_data['conn']
+    chat_id = update.effective_chat.id
+
+    rows = conn.execute(
+        'SELECT wallet, label FROM wallets WHERE chat_id=?', (chat_id,)
+    ).fetchall()
+
+    if not rows:
+        await update.message.reply_text('You have no wallets registered.')
+        return
+
+    buttons = []
+    for row in rows:
+        raw = bytes(row['wallet'])
+        label = row['label']
+        display = f'❌ {label} ({wallet_short(raw)})' if label else f'❌ {wallet_short(raw)}'
+        buttons.append([InlineKeyboardButton(display, callback_data=f'unwal:{raw.hex()}')])
+
+    await update.message.reply_text(
+        'Select a wallet to unregister:',
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+async def callback_unwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = context.bot_data['conn']
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+    raw = bytes.fromhex(query.data.removeprefix('unwal:'))
+
+    conn.execute('DELETE FROM wallets WHERE chat_id=? AND wallet=?', (chat_id, raw))
+    conn.commit()
+
+    await query.edit_message_text(
+        f'✅ Unregistered wallet <code>{wallet_display(raw)}</code>.',
+        parse_mode=ParseMode.HTML,
+    )
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn    = context.bot_data['conn']
     api     = context.bot_data['api']
@@ -725,8 +918,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 None, get_operator_financials, api, op, validators
             )
 
+        wallets = conn.execute(
+            'SELECT wallet, label FROM wallets WHERE chat_id=?', (chat_id,)
+        ).fetchall()
+        wallet_pairs = [(bytes(w['wallet']), w['label']) for w in wallets]
+        wallet_delegations = await asyncio.get_event_loop().run_in_executor(
+            None, get_wallet_delegations, api, wallet_pairs, list(operator_validators.keys())
+        )
+
         _, msg = build_status_message_for_user(
-            conn, chat_id, api_data, operator_validators, vanity_map, operator_financials
+            conn, chat_id, api_data, operator_validators, vanity_map, operator_financials,
+            wallet_delegations,
         )
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
@@ -780,12 +982,15 @@ def main():
     app.add_handler(CommandHandler('start',      cmd_start))
     app.add_handler(CommandHandler('register',   cmd_register))
     app.add_handler(CommandHandler('unregister', cmd_unregister))
+    app.add_handler(CommandHandler('wallet',     cmd_wallet))
+    app.add_handler(CommandHandler('unwallet',   cmd_unwallet))
     app.add_handler(CommandHandler('status',     cmd_status))
     app.add_handler(MessageHandler(
         filters.REPLY & filters.TEXT & ~filters.COMMAND,
-        handle_register_reply,
+        handle_force_reply,
     ))
     app.add_handler(CallbackQueryHandler(callback_unregister, pattern='^unreg:'))
+    app.add_handler(CallbackQueryHandler(callback_unwallet,   pattern='^unwal:'))
 
     async def post_init(app):
         app.bot_data['loop'] = asyncio.get_event_loop()
