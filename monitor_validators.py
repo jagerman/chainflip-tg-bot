@@ -276,7 +276,10 @@ def get_wallet_delegations(api, wallets, operators):
         acc = api.query('Flip', 'Account', [ss58]).value or {}
         balance = acc.get('balance', 0)
         bond    = acc.get('bond', 0)
-        reward  = max(balance - bond, 0)
+        # Spendable = balance minus whichever is currently locking funds. After a
+        # delegate increase, max_bid > bond and reduces spendable immediately,
+        # though bond only updates at the next epoch.
+        reward  = max(balance - max(bond, max_bid), 0)
 
         out[chosen_op].append((raw, label, current, max_bid, reward))
 
@@ -468,12 +471,16 @@ def format_wallet_line(raw, label, current, upcoming, reward):
     """Format one wallet delegation sub-line."""
     name = label or wallet_short(raw)
     cur_s = format_flip(current)
-    parts = [f'{cur_s} FLIP delegated']
-    if upcoming != current:
-        parts[-1] = f'{cur_s} → {format_flip(upcoming)} FLIP delegated'
+    delta = upcoming - current
+    if delta != 0:
+        sign = '+' if delta > 0 else '-'
+        head = f'{cur_s} ({sign}{format_flip(abs(delta))} pending) FLIP delegated'
+    else:
+        head = f'{cur_s} FLIP delegated'
+    parts = [head]
     if reward > 0:
         parts.append(f'+{format_flip(reward)} claimable')
-    return f'        💼 {name}: {", ".join(parts)}'
+    return f'        👉 {name}: {", ".join(parts)}'
 
 def build_status_message_for_user(conn, chat_id, api_data, operator_validators, vanity_map, operator_financials, wallet_delegations=None):
     wallet_delegations = wallet_delegations or {}
