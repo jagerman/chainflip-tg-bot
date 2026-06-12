@@ -66,3 +66,33 @@ The monitor loop runs in an executor thread (via `run_in_executor`) because `sub
 - Keep it as a single script — don't split into modules unless it becomes unwieldy
 - Use severity level names (`ok`/`warning`/`alert`/`critical`) not colour names in code
 - Status emojis must always come from the `EMOJI` dict (configured via TOML), never hardcoded
+
+## RPC monitor (separate bot)
+
+A second monitor lives alongside the validator bot in this repo:
+
+- `monitor_rpc.py` — async daemon that polls block heights on btc/eth/arb/sol/dot/hub/tron via httpx and sends Telegram alerts on state transitions. **Send-only** — never calls `getUpdates`, so it can safely share a bot token with `monitor_validators.py` (Telegram only allows one consumer of polled updates per token, but multiple senders are fine).
+- `check_rpc.py` — one-shot diagnostic script that imports `monitor_rpc` and runs a single poll across all chains, printing heights/lag/errors. Useful for verifying endpoint config without running the daemon.
+- `monitor_rpc.toml` — config (gitignored). Endpoint URLs live here, not in code — they include private VPN IPs and internal DNS.
+- `monitor_rpc.toml.sample` — committed template showing structure with placeholder provider URLs.
+- `chainflip-rpc-monitor.service` — systemd unit (paired with `chainflip-tg-bot.service`).
+
+### Severity model
+
+Per-endpoint state in memory (no database — restarts cost at most one threshold window of re-detection):
+
+- `target_height`, `target_time`: the earliest unfulfilled chain-max observation. Cleared when the endpoint reaches `target_height`; a new target is set if endpoint < current `max_h`.
+- Severity = `now - target_time` mapped through `[thresholds]` from TOML (defaults 30s/120s/300s for warning/alert/critical).
+- Unreachable (any RPC error) is critical immediately.
+
+This is "did we reach height X within T seconds of seeing it elsewhere", not "how many blocks behind" — block-time agnostic so the same thresholds work for sub-second Arbitrum and 10-minute Bitcoin.
+
+### Per-chain polling
+
+Each chain runs its own async loop at its own cadence. Default is `monitoring.poll_interval_seconds` (60s) for every chain; override per-chain via `[poll_intervals]` in TOML.
+
+### RPC kinds and ground truth
+
+Each chain has a fixed `CHAIN_RPC` kind (`btc_rpc`, `evm`, `solana`, `substrate`, `btc_blockstream` for ground truth) that selects which JSON-RPC method to call. Ground-truth URLs are public services (publicnode/blockstream/trongrid/etc.) with sensible defaults in `monitor_rpc.py`; users can override via `[ground_truth]` in TOML.
+
+Tron uses `eth_blockNumber` on its EVM-compat jsonrpc endpoint (not the wallet REST `/wallet/getnowblock`) to hit upstream cached/dedupped paths.

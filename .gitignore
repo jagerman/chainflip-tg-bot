@@ -1,2 +1,4 @@
 monitor_validators.toml
 monitor_validators.db
+monitor_rpc.toml
+__pycache__/

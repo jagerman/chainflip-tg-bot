@@ -1,4 +1,11 @@
-# Chainflip Telegram Validator Monitor
+# Chainflip Telegram Monitors
+
+This repo contains two Telegram bots:
+
+1. **Validator Monitor** (`monitor_validators.py`) — multi-user bot that watches Chainflip operators/validators for health issues (offline, reputation drops, aggregate failures). Users register operator addresses via Telegram commands.
+2. **RPC Endpoint Monitor** (`monitor_rpc.py`) — send-only daemon that watches block heights across your btc/eth/arb/sol/dot/hub/tron RPC endpoints (and a public ground-truth source per chain), DM-alerting on lag/unreachability. See [RPC Endpoint Monitor](#rpc-endpoint-monitor-companion-bot) below.
+
+## Validator Monitor
 
 A Telegram bot that monitors Chainflip validator nodes for operators. Users can register operator addresses and receive alerts when validators go offline, reputation drops, or aggregate health degrades.
 
@@ -139,6 +146,84 @@ See `monitor_validators.toml.sample` for all options:
 | `emoji.warning` | Status indicator for warning | 🟡 |
 | `emoji.alert` | Status indicator for alert | 🟠 |
 | `emoji.critical` | Status indicator for critical | 🔴 |
+
+## RPC Endpoint Monitor (companion bot)
+
+A second, send-only daemon — `monitor_rpc.py` — that polls block heights on btc/eth/arb/sol/dot/hub/tron across multiple RPC endpoints (your own + a public ground-truth source per chain) and alerts when an endpoint falls behind or becomes unreachable. Unlike the validator monitor, it sends to a single hardcoded chat: alerts arrive in your DM, no `/register` flow.
+
+### Setup
+
+It's send-only (never calls `getUpdates`), so it can share the same Telegram bot token as the validator monitor — Telegram only restricts polling consumers per token, not senders. No `/setcommands` needed.
+
+```bash
+# Install the scripts and service (after the validator monitor setup above)
+sudo cp monitor_rpc.py check_rpc.py /opt/chainflip-tg-bot/
+sudo cp monitor_rpc.toml.sample /etc/chainflip-tg-bot/monitor_rpc.toml
+sudo editor /etc/chainflip-tg-bot/monitor_rpc.toml
+
+sudo cp chainflip-rpc-monitor.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now chainflip-rpc-monitor
+sudo journalctl -u chainflip-rpc-monitor -f
+```
+
+In the config, set:
+- `telegram.bot_token` — Telegram bot token (can reuse the validator bot's token)
+- `telegram.chat_id` — your Telegram user id (DM [@userinfobot](https://t.me/userinfobot) to find it)
+- `[endpoints.<chain>]` sections — one or more endpoint URLs per chain you want to monitor. Labels (`public`, `internal`, `secondary`, etc.) are arbitrary and appear in alert messages.
+
+### One-shot diagnostic
+
+Run a single poll across all configured endpoints and print heights/lag/errors without starting the daemon — useful for verifying endpoint config:
+
+```bash
+python3 check_rpc.py            # all chains
+python3 check_rpc.py eth tron   # only these
+python3 check_rpc.py -c /path/to/monitor_rpc.toml
+```
+
+### Alert behaviour
+
+For each endpoint we remember the earliest chain-max height we've observed elsewhere that this endpoint hasn't yet reached. Severity = time since that observation. Unreachable endpoints are critical immediately.
+
+| Severity | Default time-behind |
+|---|---|
+| Warning  | 30s |
+| Alert    | 120s |
+| Critical | 300s |
+
+Block time is intentionally not part of the formula — the semantic is *"did we reach height X within T seconds of observing it elsewhere"*, which works the same for sub-second Arbitrum and 10-minute Bitcoin.
+
+Per-chain poll intervals are configurable via `[poll_intervals]`. The default for every chain is `monitoring.poll_interval_seconds` (60s); override per chain if you want to slow down (or speed up) polling for specific chains:
+
+```toml
+[poll_intervals]
+btc = 120
+eth = 30
+```
+
+### Ground truth
+
+A public reference RPC is queried per chain to detect cases where all of your nodes are stuck at the same height. Defaults (overridable via `[ground_truth]`):
+
+| Chain | Default ground truth |
+|---|---|
+| btc  | `https://blockstream.info/api/blocks/tip/height` |
+| eth  | `https://ethereum-rpc.publicnode.com` |
+| arb  | `https://arb1.arbitrum.io/rpc` |
+| sol  | `https://api.mainnet-beta.solana.com` |
+| dot  | `https://rpc.polkadot.io` |
+| hub  | `https://polkadot-asset-hub-rpc.polkadot.io` |
+| tron | `https://api.trongrid.io/jsonrpc` |
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `monitor_rpc.py` | RPC monitor daemon |
+| `check_rpc.py` | One-shot diagnostic tool |
+| `monitor_rpc.toml.sample` | Sample configuration |
+| `chainflip-rpc-monitor.service` | systemd service file |
 
 ## License
 

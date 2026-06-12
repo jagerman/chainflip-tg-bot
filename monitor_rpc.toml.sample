@@ -1,0 +1,74 @@
+[telegram]
+# Telegram bot token. Can be the same as monitor_validators.toml's token —
+# this script is send-only (does not poll for updates), so it won't conflict
+# with another bot using the same token.
+bot_token = ""
+
+# Single chat to send alerts to (a DM chat id).
+chat_id = 0
+
+[monitoring]
+poll_interval_seconds      = 60
+reminder_interval_seconds  = 3600
+request_timeout_seconds    = 10
+
+# Time-behind thresholds (seconds). An endpoint is considered "behind" until
+# it reaches a height we previously observed elsewhere; severity scales with
+# how long that target has been outstanding.
+[thresholds]
+warning  = 30
+alert    = 120
+critical = 300
+
+# Optional per-chain poll-interval overrides (seconds). Default is
+# monitoring.poll_interval_seconds for every chain.
+# [poll_intervals]
+# btc = 120
+# eth = 30
+
+[emoji]
+ok       = "🟢"
+warning  = "🟡"
+alert    = "🟠"
+critical = "🔴"
+
+# Per-chain endpoints to monitor. Each chain has one or more endpoints keyed
+# by an arbitrary label of your choosing — the label is just what shows up in
+# alert messages. Add as many or as few as you want; only configured chains
+# are monitored.
+#
+# Supported chains: btc, eth, arb, sol, dot, hub, tron
+
+[endpoints.btc]
+public = "https://btc.getblock.io/abc123def456789abcdef0123456789/mainnet/"
+
+[endpoints.eth]
+public    = "https://eth-mainnet.g.alchemy.com/v2/aBcDeFgHiJkLmNoPqRsTuVwXyZ012345"
+secondary = "https://mainnet.infura.io/v3/0123456789abcdef0123456789abcdef"
+backup    = "http://10.0.0.11:8545"
+
+[endpoints.arb]
+public    = "https://arbitrum-mainnet.infura.io/v3/0123456789abcdef0123456789abcdef"
+secondary = "http://10.0.0.11:8547"
+
+[endpoints.sol]
+public = "https://example.solana-mainnet.quiknode.pro/abcdef0123456789abcdef0123456789/"
+
+[endpoints.dot]
+public    = "https://polkadot.api.onfinality.io/rpc?apikey=fedcba9876543210fedcba9876543210"
+secondary = "http://10.0.0.11:9933"
+
+[endpoints.hub]
+public    = "https://statemint.api.onfinality.io/rpc?apikey=fedcba9876543210fedcba9876543210"
+secondary = "http://10.0.0.11:9944"
+
+[endpoints.tron]
+public = "https://api.tron.quiknode.pro/abcdef0123456789abcdef0123456789/jsonrpc/"
+
+# Optional ground-truth URL overrides. Built-in defaults are sensible public
+# RPCs (blockstream.info for BTC, publicnode for ETH/DOT/HUB, mainnet-beta for
+# Solana, polkadot.io for DOT/HUB, trongrid for TRON). Only set entries here
+# if you want to override a default. The RPC protocol for each chain's ground
+# truth is fixed; you only override the URL.
+# [ground_truth]
+# eth = "https://ethereum-rpc.publicnode.com"

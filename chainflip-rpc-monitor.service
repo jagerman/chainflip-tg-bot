@@ -1,0 +1,22 @@
+[Unit]
+Description=Chainflip RPC Endpoint Monitor
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/chainflip-tg-bot/venv/bin/python3 /opt/chainflip-tg-bot/monitor_rpc.py /etc/chainflip-tg-bot/monitor_rpc.toml
+WorkingDirectory=/opt/chainflip-tg-bot
+Restart=on-failure
+RestartSec=10
+User=chainflip-tg-bot
+Group=chainflip-tg-bot
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+Environment=HOME=/var/lib/chainflip-tg-bot
+
+[Install]
+WantedBy=multi-user.target
