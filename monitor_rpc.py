@@ -38,7 +38,7 @@ import time
 import tomllib
 from pathlib import Path
 
-import httpx
+import aiohttp
 from telegram import Bot
 from telegram.constants import ParseMode
 
@@ -110,48 +110,48 @@ def fmt_secs(seconds):
     return f'{int(seconds // 3600)}h{int((seconds % 3600) // 60):02d}m'
 
 def fmt_error(ex):
-    """Render an httpx/network exception concisely (one short line, no doc URLs)."""
-    if isinstance(ex, httpx.HTTPStatusError):
-        return f'HTTP {ex.response.status_code} {ex.response.reason_phrase}'
-    if isinstance(ex, httpx.ConnectError):
-        return f'connect error: {ex}'
-    if isinstance(ex, httpx.TimeoutException):
-        return 'timeout'
-    msg = str(ex).splitlines()[0] if str(ex) else ''
+    """Render an exception as a concise one-line summary.
+    aiohttp's str() already includes the underlying cause (DNS error, refused
+    connection, etc.) for connection errors, so we mostly just use it directly."""
+    if isinstance(ex, aiohttp.ClientResponseError):
+        return f'HTTP {ex.status} {ex.message}'
+    msg = str(ex).splitlines()[0].strip() if str(ex) else ''
     return f'{type(ex).__name__}: {msg}' if msg else type(ex).__name__
 
 # ── RPC height fetchers ──────────────────────────────────────────────────────
 
+async def _post_json(client, url, payload):
+    async with client.post(url, json=payload) as resp:
+        resp.raise_for_status()
+        return await resp.json(content_type=None)
+
 async def fetch_height(client, kind, url):
     """Return the current block/slot height for the given endpoint, or raise."""
     if kind == 'btc_rpc':
-        r = await client.post(url, json={'jsonrpc': '1.0', 'id': 1,
-                                          'method': 'getblockcount', 'params': []})
-        r.raise_for_status()
-        return int(r.json()['result'])
+        data = await _post_json(client, url, {'jsonrpc': '1.0', 'id': 1,
+                                              'method': 'getblockcount', 'params': []})
+        return int(data['result'])
 
     if kind == 'btc_blockstream':
-        r = await client.get(url)
-        r.raise_for_status()
-        return int(r.text.strip())
+        async with client.get(url) as resp:
+            resp.raise_for_status()
+            text = await resp.text()
+        return int(text.strip())
 
     if kind == 'evm':
-        r = await client.post(url, json={'jsonrpc': '2.0', 'id': 1,
-                                          'method': 'eth_blockNumber', 'params': []})
-        r.raise_for_status()
-        return int(r.json()['result'], 16)
+        data = await _post_json(client, url, {'jsonrpc': '2.0', 'id': 1,
+                                              'method': 'eth_blockNumber', 'params': []})
+        return int(data['result'], 16)
 
     if kind == 'solana':
-        r = await client.post(url, json={'jsonrpc': '2.0', 'id': 1,
-                                          'method': 'getSlot', 'params': []})
-        r.raise_for_status()
-        return int(r.json()['result'])
+        data = await _post_json(client, url, {'jsonrpc': '2.0', 'id': 1,
+                                              'method': 'getSlot', 'params': []})
+        return int(data['result'])
 
     if kind == 'substrate':
-        r = await client.post(url, json={'jsonrpc': '2.0', 'id': 1,
-                                          'method': 'chain_getHeader', 'params': []})
-        r.raise_for_status()
-        return int(r.json()['result']['number'], 16)
+        data = await _post_json(client, url, {'jsonrpc': '2.0', 'id': 1,
+                                              'method': 'chain_getHeader', 'params': []})
+        return int(data['result']['number'], 16)
 
     raise ValueError(f'unknown rpc kind: {kind}')
 
@@ -232,6 +232,8 @@ async def poll_chain(client, state, chain, thresholds, reminder_interval):
             results[name] = await task
         except Exception as ex:
             results[name] = ex
+            label = 'ground_truth' if name == '__gt__' else name
+            log.warning(f'{chain}/{label}: {fmt_error(ex)}')
 
     heights = [v for v in results.values() if isinstance(v, int)]
     max_h = max(heights) if heights else None
@@ -323,7 +325,8 @@ async def main_async(config_path):
         except Exception as ex:
             log.error(f'Telegram send failed: {ex}')
 
-    async with httpx.AsyncClient(timeout=request_timeout) as client:
+    timeout = aiohttp.ClientTimeout(total=request_timeout)
+    async with aiohttp.ClientSession(timeout=timeout) as client:
         log.info(f'RPC monitor started (thresholds {thresholds}).')
         loops = [
             asyncio.create_task(

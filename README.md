@@ -28,7 +28,7 @@ Message [@BotFather](https://t.me/BotFather) on Telegram:
 Requires Python 3.11+.
 
 ```bash
-pip install python-telegram-bot substrate-interface requests
+pip install python-telegram-bot substrate-interface requests aiohttp eth-utils
 ```
 
 ### 3. Install the bot

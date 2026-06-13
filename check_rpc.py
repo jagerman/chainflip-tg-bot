@@ -17,7 +17,7 @@ import asyncio
 import sys
 from pathlib import Path
 
-import httpx
+import aiohttp
 
 import monitor_rpc
 from monitor_rpc import (
@@ -67,7 +67,8 @@ async def amain(config_path, chains):
         print(f'Unknown or unconfigured chains: {unknown}', file=sys.stderr)
         sys.exit(1)
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as client:
         for chain in chains:
             results = await check_chain(client, chain)
             render(chain, results)
