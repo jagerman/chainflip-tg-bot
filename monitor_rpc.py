@@ -198,8 +198,6 @@ def evaluate_endpoint(state, chain, name, result, max_h, now,
     prev_severity = s['severity']
     s['severity'] = new_severity
 
-    if first_seen:
-        return None  # No alert on first observation
     if new_severity != prev_severity:
         if SEVERITY_RANK[new_severity] > SEVERITY_RANK[prev_severity]:
             msg = f'{e(new_severity)} <b>{chain}/{name}</b> {new_severity.upper()}: {reason}'
