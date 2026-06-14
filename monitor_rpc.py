@@ -158,7 +158,7 @@ async def fetch_height(client, kind, url):
 # ── Per-endpoint evaluation ──────────────────────────────────────────────────
 
 def evaluate_endpoint(state, chain, name, result, max_h, now,
-                      thresholds, reminder_interval):
+                      thresholds, reminder_interval, min_consecutive_failures):
     """Update in-memory state for one endpoint; return alert_msg or None."""
     key = (chain, name)
     s = state.get(key)
@@ -167,13 +167,21 @@ def evaluate_endpoint(state, chain, name, result, max_h, now,
         s = {
             'last_height': 0, 'target_height': None, 'target_time': None,
             'severity': 'ok', 'last_reminder': 0,
+            'consecutive_failures': 0,
         }
         state[key] = s
 
     if isinstance(result, Exception):
+        s['consecutive_failures'] += 1
+        # Tolerate transient request failures (e.g. one-off 502s, brief upstream
+        # blips). Only escalate to critical once we've seen `min_consecutive_failures`
+        # in a row. The warning log in poll_chain still records every failure.
+        if s['consecutive_failures'] < min_consecutive_failures:
+            return None
         new_severity = 'critical'
-        reason = f'unreachable — {fmt_error(result)}'
+        reason = f'unreachable ({s["consecutive_failures"]} polls) — {fmt_error(result)}'
     else:
+        s['consecutive_failures'] = 0
         s['last_height'] = result
 
         # Clear the target if this endpoint has caught up to it.
@@ -213,7 +221,7 @@ def evaluate_endpoint(state, chain, name, result, max_h, now,
 
 # ── Poll loop ────────────────────────────────────────────────────────────────
 
-async def poll_chain(client, state, chain, thresholds, reminder_interval):
+async def poll_chain(client, state, chain, thresholds, reminder_interval, min_consecutive_failures):
     """Poll one chain's endpoints and ground truth. Returns list of alert strings."""
     now = time.time()
     endpoints = ENDPOINTS[chain]
@@ -242,17 +250,20 @@ async def poll_chain(client, state, chain, thresholds, reminder_interval):
     for name in endpoints:
         msg = evaluate_endpoint(
             state, chain, name, results[name], max_h, now, thresholds, reminder_interval,
+            min_consecutive_failures,
         )
         if msg:
             alerts.append(msg)
     return alerts
 
-async def chain_loop(chain, interval, client, state, thresholds, reminder_interval, send):
+async def chain_loop(chain, interval, client, state, thresholds, reminder_interval,
+                    min_consecutive_failures, send):
     """Per-chain forever-loop: poll → send alerts → sleep."""
     log.info(f'{chain}: polling every {interval}s')
     while True:
         try:
-            alerts = await poll_chain(client, state, chain, thresholds, reminder_interval)
+            alerts = await poll_chain(client, state, chain, thresholds, reminder_interval,
+                                       min_consecutive_failures)
         except Exception as ex:
             log.error(f'{chain}: poll error: {ex}', exc_info=True)
             alerts = []
@@ -297,6 +308,7 @@ async def main_async(config_path):
     default_interval  = config['monitoring'].get('poll_interval_seconds', 60)
     reminder_interval = config['monitoring'].get('reminder_interval_seconds', 3600)
     request_timeout   = config['monitoring'].get('request_timeout_seconds', 10)
+    min_consecutive_failures = config['monitoring'].get('min_consecutive_failures', 2)
 
     intervals = {c: default_interval for c in ENDPOINTS}
     intervals.update(config.get('poll_intervals', {}))
@@ -329,7 +341,7 @@ async def main_async(config_path):
         loops = [
             asyncio.create_task(
                 chain_loop(chain, intervals[chain], client, state, thresholds,
-                           reminder_interval, send)
+                           reminder_interval, min_consecutive_failures, send)
             )
             for chain in ENDPOINTS
         ]

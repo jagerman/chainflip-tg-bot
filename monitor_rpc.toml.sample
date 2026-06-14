@@ -11,6 +11,10 @@ chat_id = 0
 poll_interval_seconds      = 60
 reminder_interval_seconds  = 3600
 request_timeout_seconds    = 10
+# Number of consecutive request failures (timeouts, 5xx, connection refused,
+# etc.) required before alerting that an endpoint is unreachable. Set to 1
+# to alert on every single failure. Default 2 hides one-off transients.
+min_consecutive_failures   = 2
 
 # Time-behind thresholds (seconds). An endpoint is considered "behind" until
 # it reaches a height we previously observed elsewhere; severity scales with
