@@ -271,6 +271,34 @@ async def chain_loop(chain, interval, client, state, thresholds, reminder_interv
             await send(msg)
         await asyncio.sleep(interval)
 
+# ── Telegram sender ──────────────────────────────────────────────────────────
+
+async def sender_task(queue, bot, chat_id):
+    """Drain the alert queue, sending each to Telegram with retry+backoff.
+
+    Outbound network blips on this host shouldn't lose alerts; queued messages
+    will sit here until the connection comes back. Gives up after ~7 minutes
+    of failed attempts per message so a persistent failure can't pile up
+    forever, but that's far longer than any normal blip.
+    """
+    while True:
+        msg = await queue.get()
+        delay = 2
+        for attempt in range(1, 11):
+            try:
+                await bot.send_message(
+                    chat_id=chat_id, text=msg,
+                    parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                )
+                break
+            except Exception as ex:
+                if attempt == 10:
+                    log.error(f'Telegram send failed, giving up after {attempt} attempts: {ex}')
+                    break
+                log.warning(f'Telegram send failed (attempt {attempt}), retrying in {delay}s: {ex}')
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def load_config(config_path):
@@ -327,17 +355,18 @@ async def main_async(config_path):
 
     state = {}  # (chain, endpoint) -> {last_height, target_height, target_time, severity, last_reminder}
     bot = Bot(token=bot_token)
+    alert_queue: asyncio.Queue[str] = asyncio.Queue()
 
     async def send(msg):
-        try:
-            await bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML,
-                                   disable_web_page_preview=True)
-        except Exception as ex:
-            log.error(f'Telegram send failed: {ex}')
+        # Polling tasks just enqueue — the sender_task below handles delivery
+        # with retry+backoff so a transient outbound-network hiccup on this
+        # host doesn't silently drop the alert it produced.
+        await alert_queue.put(msg)
 
     timeout = aiohttp.ClientTimeout(total=request_timeout)
     async with aiohttp.ClientSession(timeout=timeout) as client:
         log.info(f'RPC monitor started (thresholds {thresholds}).')
+        sender = asyncio.create_task(sender_task(alert_queue, bot, chat_id))
         loops = [
             asyncio.create_task(
                 chain_loop(chain, intervals[chain], client, state, thresholds,
@@ -345,7 +374,7 @@ async def main_async(config_path):
             )
             for chain in ENDPOINTS
         ]
-        await asyncio.gather(*loops)
+        await asyncio.gather(sender, *loops)
 
 def main():
     config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).with_suffix('.toml')
