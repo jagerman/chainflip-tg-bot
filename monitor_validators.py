@@ -191,7 +191,22 @@ def fetch_chain_data(api):
     authorities = set(api.query('Validator', 'CurrentAuthorities').value or [])
     active_bidders = set(api.query('Validator', 'ActiveBidder').value or [])
 
-    return current_block, block_timestamp, vanity_map, all_reputations, all_heartbeats, authorities, active_bidders
+    all_versions = {
+        str(k): _version_tuple(v.value)
+        for k, v in api.query_map('Validator', 'NodeCFEVersion')
+    }
+
+    return current_block, block_timestamp, vanity_map, all_reputations, all_heartbeats, authorities, active_bidders, all_versions
+
+def _version_tuple(v):
+    """Convert a chain-encoded CFE version dict to a comparable (major, minor, patch) tuple."""
+    if not v:
+        return (0, 0, 0)
+    return (v.get('major', 0), v.get('minor', 0), v.get('patch', 0))
+
+def _version_str(t):
+    """Render a (major, minor, patch) tuple as 'X.Y.Z' (or '?' if zero)."""
+    return f'{t[0]}.{t[1]}.{t[2]}' if t != (0, 0, 0) else '?'
 
 FLIP_DECIMALS = 10**18
 
@@ -484,7 +499,15 @@ def format_wallet_line(raw, label, current, upcoming, reward):
 
 def build_status_message_for_user(conn, chat_id, api_data, operator_validators, vanity_map, operator_financials, wallet_delegations=None):
     wallet_delegations = wallet_delegations or {}
-    current_block, block_timestamp, _, all_reputations, all_heartbeats, authorities, active_bidders = api_data
+    current_block, block_timestamp, _, all_reputations, all_heartbeats, authorities, active_bidders, all_versions = api_data
+
+    # Highest CFE version reported by any of this user's monitored validators.
+    # Validators below this in any chain section are flagged as outdated.
+    monitored = {v for vs in operator_validators.values() for v in vs}
+    max_version = max(
+        (all_versions.get(v, (0, 0, 0)) for v in monitored),
+        default=(0, 0, 0),
+    )
 
     if not operator_validators:
         return 'ok', f'{e("ok")} You have no operators registered. Use /register &lt;operator&gt; to add one.'
@@ -511,12 +534,20 @@ def build_status_message_for_user(conn, chat_id, api_data, operator_validators, 
             else:
                 severity = 'ok' if online else 'critical'
 
+            version = all_versions.get(validator, (0, 0, 0))
+            outdated = version != (0, 0, 0) and version < max_version
+            if outdated:
+                severity = worst(severity, 'warning')
+
             val_severities.append(severity)
             link = f'<a href="{SCAN_VALIDATOR}/{validator}">{name}</a>'
             role = ''
             if validator not in authorities:
                 role = '🌱 ' if validator in active_bidders else '💤 '
-            val_lines.append(f'    {e(severity)} {role}{link} (rep: {rep})')
+            ver_tail = f', CFE {_version_str(version)}'
+            if outdated:
+                ver_tail += ' <i>(outdated)</i>'
+            val_lines.append(f'    {e(severity)} {role}{link} (rep: {rep}{ver_tail})')
 
         op_severity = worst(*val_severities) if val_severities else 'ok'
 
@@ -581,7 +612,7 @@ def run_poll(app, conn, api, reminder_interval):
     if not subs:
         return
 
-    current_block, block_timestamp, vanity_map, all_reputations, all_heartbeats, _, _ = fetch_chain_data(api)
+    current_block, block_timestamp, vanity_map, all_reputations, all_heartbeats, _, _, _ = fetch_chain_data(api)
 
     operator_validators_cache = {}
 
@@ -912,7 +943,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         api_data = await asyncio.get_event_loop().run_in_executor(None, fetch_chain_data, api)
-        _, _, vanity_map, _, _, _, _ = api_data
+        _, _, vanity_map, _, _, _, _, _ = api_data
 
         operator_validators = {}
         operator_financials = {}
