@@ -51,7 +51,8 @@ log = logging.getLogger(__name__)
 
 HEARTBEAT_BLOCK_INTERVAL = 150
 
-# Reputation thresholds
+# Reputation thresholds. Max is the cap a fully-healthy validator sits at.
+REP_MAX      = 2880
 REP_WARNING  = 2500
 REP_ALERT    = 1000
 REP_CRITICAL = 0
@@ -149,6 +150,10 @@ def db_connect(path):
             alert_alert       INTEGER  DEFAULT 0,
             alert_critical    INTEGER  DEFAULT 0,
             last_reminder     REAL     DEFAULT 0,
+            -- Snapshot of the reputation value the last time it changed, and
+            -- when that change happened. Used to display the trend.
+            last_change_rep   INTEGER,
+            last_change_time  REAL,
             PRIMARY KEY (chat_id, operator, validator)
         );
 
@@ -168,6 +173,12 @@ def db_connect(path):
             PRIMARY KEY (chat_id, wallet)
         );
     ''')
+    # Schema migration for older DBs missing the trend-tracking columns.
+    existing = {row['name'] for row in conn.execute('PRAGMA table_info(validator_state)').fetchall()}
+    if 'last_change_rep' not in existing:
+        conn.execute('ALTER TABLE validator_state ADD COLUMN last_change_rep INTEGER')
+    if 'last_change_time' not in existing:
+        conn.execute('ALTER TABLE validator_state ADD COLUMN last_change_time REAL')
     conn.commit()
     return conn
 
@@ -207,6 +218,16 @@ def _version_tuple(v):
 def _version_str(t):
     """Render a (major, minor, patch) tuple as 'X.Y.Z' (or '?' if zero)."""
     return f'{t[0]}.{t[1]}.{t[2]}' if t != (0, 0, 0) else '?'
+
+def _fmt_age(seconds):
+    """Format an age (seconds, may be float) compactly: '12s', '7.2m', '3.4h', '2.1d'."""
+    if seconds < 60:
+        return f'{int(seconds)}s'
+    if seconds < 3600:
+        return f'{seconds/60:.1f}m'
+    if seconds < 86400:
+        return f'{seconds/3600:.1f}h'
+    return f'{seconds/86400:.1f}d'
 
 FLIP_DECIMALS = 10**18
 
@@ -335,17 +356,22 @@ def process_validator(conn, chat_id, operator, validator, online, reputation, no
         conn.commit()
         return []  # No history yet — skip alerting on first poll
 
-    prev_rep      = row['reputation']
-    cons_drops    = row['consecutive_drops']
-    was_offline   = bool(row['alert_offline'])
-    was_warning   = bool(row['alert_warning'])
-    was_alert     = bool(row['alert_alert'])
-    was_critical  = bool(row['alert_critical'])
-    last_reminder = row['last_reminder']
+    prev_rep         = row['reputation']
+    cons_drops       = row['consecutive_drops']
+    was_offline      = bool(row['alert_offline'])
+    was_warning      = bool(row['alert_warning'])
+    was_alert        = bool(row['alert_alert'])
+    was_critical     = bool(row['alert_critical'])
+    last_reminder    = row['last_reminder']
+    last_change_rep  = row['last_change_rep']
+    last_change_time = row['last_change_time']
 
     alerts = []
 
-    # ── Consecutive drops ───────────────────────────────────────────────────
+    # ── Consecutive drops + trend snapshot ──────────────────────────────────
+    if reputation != prev_rep:
+        last_change_rep  = prev_rep
+        last_change_time = now
     if reputation < prev_rep:
         cons_drops += 1
     elif reputation > prev_rep:
@@ -408,12 +434,12 @@ def process_validator(conn, chat_id, operator, validator, online, reputation, no
         UPDATE validator_state
         SET reputation=?, consecutive_drops=?,
             alert_offline=?, alert_warning=?, alert_alert=?, alert_critical=?,
-            last_reminder=?
+            last_reminder=?, last_change_rep=?, last_change_time=?
         WHERE chat_id=? AND operator=? AND validator=?
     ''', (
         reputation, cons_drops,
         int(new_offline), int(new_warning), int(new_alert), int(new_critical),
-        last_reminder,
+        last_reminder, last_change_rep, last_change_time,
         chat_id, operator, validator
     ))
     conn.commit()
@@ -544,10 +570,21 @@ def build_status_message_for_user(conn, chat_id, api_data, operator_validators, 
             role = ''
             if validator not in authorities:
                 role = '🌱 ' if validator in active_bidders else '💤 '
+
+            trend_tail = ''
+            if row and rep < REP_MAX and row['last_change_rep'] is not None:
+                last_rep = row['last_change_rep']
+                last_time = row['last_change_time']
+                if rep != last_rep and last_time is not None:
+                    delta = rep - last_rep
+                    age = _fmt_age(time.time() - last_time)
+                    body = f'{delta:+d} since {age} ago'
+                    trend_tail = f', <b>{body}</b>' if delta < 0 else f', {body}'
+
             ver_tail = f', CFE {_version_str(version)}'
             if outdated:
                 ver_tail += ' <i>(outdated)</i>'
-            val_lines.append(f'    {e(severity)} {role}{link} (rep: {rep}{ver_tail})')
+            val_lines.append(f'    {e(severity)} {role}{link} (rep: {rep}{trend_tail}{ver_tail})')
 
         op_severity = worst(*val_severities) if val_severities else 'ok'
 
