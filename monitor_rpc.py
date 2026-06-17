@@ -20,12 +20,14 @@ and sends Telegram alerts on state transitions. Send-only — does not poll
 Telegram for updates, so it can safely share a bot token with other bots.
 
 Severity model: at each poll we observe max_h (the highest height reported by
-any of our endpoints or the ground-truth RPC). For each monitored endpoint we
-remember the earliest max_h it has not yet caught up to (target_height) and
-when we observed it (target_time). If the endpoint reaches that target the
-state clears. Severity scales with `now - target_time` regardless of chain
-block time — i.e. "how long until we caught up to a height we observed
-elsewhere", not "how many blocks behind".
+any of our endpoints or the ground-truth RPC) and append it to a per-chain
+ring buffer of (time, max_h) checkpoints. For each monitored endpoint we
+identify the oldest checkpoint the endpoint has not yet reached — its age is
+the "time behind" used to determine severity. The endpoint is considered
+fully recovered ("ok") only when every checkpoint older than warning_threshold
+has been met, i.e. the endpoint is current with the chain head as observed
+warning_threshold seconds ago (not just with the chain head from whenever the
+last warning happened to fire).
 
 Usage:
   ./monitor_rpc.py [config_file]
@@ -36,6 +38,7 @@ import logging
 import sys
 import time
 import tomllib
+from collections import deque
 from pathlib import Path
 
 import aiohttp
@@ -157,18 +160,19 @@ async def fetch_height(client, kind, url):
 
 # ── Per-endpoint evaluation ──────────────────────────────────────────────────
 
-def evaluate_endpoint(state, chain, name, result, max_h, now,
+def evaluate_endpoint(state, chain, name, result, history, now,
                       thresholds, reminder_interval, min_consecutive_failures):
-    """Update in-memory state for one endpoint; return alert_msg or None."""
+    """Update in-memory state for one endpoint; return alert_msg or None.
+
+    `history` is the chain's ring buffer of (time, max_h) checkpoints. The
+    endpoint's "time behind" is the age of the oldest checkpoint it hasn't
+    reached — so the chain head has to advance forward of the endpoint for
+    the *threshold duration* before we trigger, and the endpoint has to
+    catch up to a checkpoint at least *threshold* seconds old to recover."""
     key = (chain, name)
     s = state.get(key)
-    first_seen = s is None
-    if first_seen:
-        s = {
-            'last_height': 0, 'target_height': None, 'target_time': None,
-            'severity': 'ok', 'last_reminder': 0,
-            'consecutive_failures': 0,
-        }
+    if s is None:
+        s = {'severity': 'ok', 'last_reminder': 0, 'consecutive_failures': 0}
         state[key] = s
 
     if isinstance(result, Exception):
@@ -182,23 +186,20 @@ def evaluate_endpoint(state, chain, name, result, max_h, now,
         reason = f'unreachable ({s["consecutive_failures"]} polls) — {fmt_error(result)}'
     else:
         s['consecutive_failures'] = 0
-        s['last_height'] = result
 
-        # Clear the target if this endpoint has caught up to it.
-        if s['target_height'] is not None and result >= s['target_height']:
-            s['target_height'] = None
-            s['target_time']   = None
+        # Walk the chain history oldest → newest and find the first checkpoint
+        # this endpoint hasn't reached. Its age is our "time behind".
+        target_time, target_height = None, None
+        for t, mh in history:
+            if result < mh:
+                target_time, target_height = t, mh
+                break
 
-        # If we're now below the chain max and have no target, start one.
-        if s['target_height'] is None and max_h is not None and result < max_h:
-            s['target_height'] = max_h
-            s['target_time']   = now
-
-        if s['target_time'] is not None:
-            time_behind  = now - s['target_time']
+        if target_time is not None:
+            time_behind  = now - target_time
             new_severity = severity_for_time(time_behind, thresholds)
-            reason = (f'height {result}, target {s["target_height"]} '
-                      f'({fmt_secs(time_behind)} behind)')
+            reason = (f'height {result}, target {target_height} '
+                      f'from {fmt_secs(time_behind)} ago')
         else:
             new_severity = 'ok'
             reason = f'height {result}'
@@ -221,8 +222,11 @@ def evaluate_endpoint(state, chain, name, result, max_h, now,
 
 # ── Poll loop ────────────────────────────────────────────────────────────────
 
-async def poll_chain(client, state, chain, thresholds, reminder_interval, min_consecutive_failures):
-    """Poll one chain's endpoints and ground truth. Returns list of alert strings."""
+async def poll_chain(client, state, history, chain, thresholds, reminder_interval, min_consecutive_failures):
+    """Poll one chain's endpoints and ground truth. Returns list of alert strings.
+
+    `history` is the per-chain deque of (time, max_h) checkpoints; we append
+    this poll's observation and prune anything older than the buffer horizon."""
     now = time.time()
     endpoints = ENDPOINTS[chain]
     kind = CHAIN_RPC[chain]
@@ -245,11 +249,19 @@ async def poll_chain(client, state, chain, thresholds, reminder_interval, min_co
     max_h = max(heights) if heights else None
     if max_h is None:
         log.warning(f'{chain}: every endpoint and ground truth failed')
+    else:
+        history.append((now, max_h))
+        # Keep history twice as long as the slowest severity threshold so an
+        # endpoint that drifts up into critical and back down still has
+        # checkpoints to compare against.
+        horizon = now - 2 * thresholds['critical']
+        while history and history[0][0] < horizon:
+            history.popleft()
 
     alerts = []
     for name in endpoints:
         msg = evaluate_endpoint(
-            state, chain, name, results[name], max_h, now, thresholds, reminder_interval,
+            state, chain, name, results[name], history, now, thresholds, reminder_interval,
             min_consecutive_failures,
         )
         if msg:
@@ -260,9 +272,10 @@ async def chain_loop(chain, interval, client, state, thresholds, reminder_interv
                     min_consecutive_failures, send):
     """Per-chain forever-loop: poll → send alerts → sleep."""
     log.info(f'{chain}: polling every {interval}s')
+    history = deque()
     while True:
         try:
-            alerts = await poll_chain(client, state, chain, thresholds, reminder_interval,
+            alerts = await poll_chain(client, state, history, chain, thresholds, reminder_interval,
                                        min_consecutive_failures)
         except Exception as ex:
             log.error(f'{chain}: poll error: {ex}', exc_info=True)
