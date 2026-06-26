@@ -133,9 +133,12 @@ def db_connect(path):
     conn.execute('PRAGMA journal_mode=WAL')
     conn.executescript('''
         CREATE TABLE IF NOT EXISTS subscriptions (
-            chat_id        INTEGER,
-            operator       TEXT,
-            last_severity  TEXT DEFAULT NULL,
+            chat_id            INTEGER,
+            operator           TEXT,
+            last_severity      TEXT DEFAULT NULL,
+            -- Highest epoch we've already run the auction-dropout check for.
+            -- Used to fire at most one alert per epoch per (chat_id, operator).
+            last_checked_epoch INTEGER,
             PRIMARY KEY (chat_id, operator)
         );
 
@@ -179,6 +182,12 @@ def db_connect(path):
         conn.execute('ALTER TABLE validator_state ADD COLUMN last_change_rep INTEGER')
     if 'last_change_time' not in existing:
         conn.execute('ALTER TABLE validator_state ADD COLUMN last_change_time REAL')
+    # Track the most recent epoch we've already done the epoch-dropout check for,
+    # per (chat_id, operator). Set to the chain's current epoch on first install
+    # so we don't alert about all-historic dropouts the first time the daemon runs.
+    sub_existing = {row['name'] for row in conn.execute('PRAGMA table_info(subscriptions)').fetchall()}
+    if 'last_checked_epoch' not in sub_existing:
+        conn.execute('ALTER TABLE subscriptions ADD COLUMN last_checked_epoch INTEGER')
     conn.commit()
     return conn
 
@@ -207,7 +216,46 @@ def fetch_chain_data(api):
         for k, v in api.query_map('Validator', 'NodeCFEVersion')
     }
 
-    return current_block, block_timestamp, vanity_map, all_reputations, all_heartbeats, authorities, active_bidders, all_versions
+    # Current epoch, the auction cutoff bond, and the per-operator delegation
+    # snapshots for this epoch. The snapshot for (current_epoch, op) lists the
+    # validators that actually entered the epoch under that operator; the bond
+    # is the auction cutoff so we can tell whether an operator could have
+    # afforded more validators than they got admitted.
+    current_epoch = api.query('Validator', 'CurrentEpoch').value
+    current_bond = api.query('Validator', 'Bond').value or 0
+    epoch_snapshots = {}
+    for k, v in api.query_map('Validator', 'DelegationSnapshots'):
+        kv = k.value if hasattr(k, 'value') else k
+        if kv[0] == current_epoch:
+            snap = v.value if hasattr(v, 'value') else v
+            epoch_snapshots[kv[1]] = snap
+
+    return (current_block, block_timestamp, vanity_map, all_reputations, all_heartbeats,
+            authorities, active_bidders, all_versions, current_epoch, current_bond,
+            epoch_snapshots)
+
+def compute_epoch_dropouts(snapshot, bond, managed_validators):
+    """
+    Given a (epoch, operator) DelegationSnapshot, the current epoch's auction
+    bond, and the operator's currently-managed validator set, return the list
+    of validators that *could* have entered the epoch but didn't.
+
+    Returns []  if the operator was outbid (no snapshot), at full capacity
+    (no slack in the bid to admit another validator at the cutoff bond), or
+    if every managed validator made it into the snapshot.
+    """
+    if not snapshot or not bond:
+        return []
+    val_amts = snapshot.get('validators') or []
+    del_amts = snapshot.get('delegators') or []
+    total_bid = sum(a for _, a in val_amts) + sum(a for _, a in del_amts)
+    n_admitted = len(val_amts)
+    if total_bid // bond <= n_admitted:
+        # No room to fit another validator at the cutoff bond — operator is at
+        # capacity. Extra managed validators are intentionally on the bench.
+        return []
+    admitted = {v for v, _ in val_amts}
+    return [v for v in managed_validators if v not in admitted]
 
 def _version_tuple(v):
     """Convert a chain-encoded CFE version dict to a comparable (major, minor, patch) tuple."""
@@ -525,7 +573,7 @@ def format_wallet_line(raw, label, current, upcoming, reward):
 
 def build_status_message_for_user(conn, chat_id, api_data, operator_validators, vanity_map, operator_financials, wallet_delegations=None):
     wallet_delegations = wallet_delegations or {}
-    current_block, block_timestamp, _, all_reputations, all_heartbeats, authorities, active_bidders, all_versions = api_data
+    current_block, block_timestamp, _, all_reputations, all_heartbeats, authorities, active_bidders, all_versions, _, _, _ = api_data
 
     # Highest CFE version reported by any of this user's monitored validators.
     # Validators below this in any chain section are flagged as outdated.
@@ -649,7 +697,8 @@ def run_poll(app, conn, api, reminder_interval):
     if not subs:
         return
 
-    current_block, block_timestamp, vanity_map, all_reputations, all_heartbeats, _, _, _ = fetch_chain_data(api)
+    (current_block, block_timestamp, vanity_map, all_reputations, all_heartbeats,
+     _, _, _, current_epoch, current_bond, epoch_snapshots) = fetch_chain_data(api)
 
     operator_validators_cache = {}
 
@@ -683,6 +732,35 @@ def run_poll(app, conn, api, reminder_interval):
         for severity, msg in agg_alerts:
             chat_alerts.append((severity, None, None, msg))
 
+        # ── Epoch-dropout check (one-shot per epoch transition) ──────────────
+        last_checked_row = conn.execute(
+            'SELECT last_checked_epoch FROM subscriptions WHERE chat_id=? AND operator=?',
+            (chat_id, operator)
+        ).fetchone()
+        last_checked = last_checked_row['last_checked_epoch'] if last_checked_row else None
+        if last_checked is None:
+            # First time seeing this subscription: anchor at current epoch so we
+            # don't retro-alert about whatever happened before the bot was set up.
+            conn.execute(
+                'UPDATE subscriptions SET last_checked_epoch=? WHERE chat_id=? AND operator=?',
+                (current_epoch, chat_id, operator)
+            )
+            conn.commit()
+        elif current_epoch > last_checked:
+            snap = epoch_snapshots.get(operator)
+            for vid in compute_epoch_dropouts(snap, current_bond, validators):
+                vname = vanity_map.get(vid, short_addr(vid))
+                chat_alerts.append((
+                    'alert', vname, vid,
+                    f'{e("alert")} Failed to enter epoch {current_epoch} '
+                    'despite operator having delegated funds to support it — investigate',
+                ))
+            conn.execute(
+                'UPDATE subscriptions SET last_checked_epoch=? WHERE chat_id=? AND operator=?',
+                (current_epoch, chat_id, operator)
+            )
+            conn.commit()
+
         # Determine the actual current severity by examining stored alert state,
         # not just whether any transitions happened this poll.
         current_severity = _current_severity(conn, chat_id, operator)
@@ -704,7 +782,11 @@ def run_poll(app, conn, api, reminder_interval):
             continue
 
         global_severity = worst(current_severity, *[s for s, _, _, _ in chat_alerts])
-        _set_last_severity(conn, chat_id, operator, global_severity)
+        # Persist the underlying stored severity, NOT the worst-of message
+        # severity. One-shot alerts (e.g. epoch dropouts) elevate this poll's
+        # message header but shouldn't trigger an "All good" follow-up next
+        # poll just because they happened.
+        _set_last_severity(conn, chat_id, operator, current_severity)
 
         lines = [f'{e(global_severity)} <b>Chainflip Alert</b> — {op_link(operator, vanity_map)} (block {current_block}, {relative_time(block_timestamp)})\n']
 
@@ -980,7 +1062,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         api_data = await asyncio.get_event_loop().run_in_executor(None, fetch_chain_data, api)
-        _, _, vanity_map, _, _, _, _, _ = api_data
+        _, _, vanity_map, _, _, _, _, _, _, _, _ = api_data
 
         operator_validators = {}
         operator_financials = {}
