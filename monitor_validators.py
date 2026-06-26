@@ -225,10 +225,14 @@ def fetch_chain_data(api):
     current_bond = api.query('Validator', 'Bond').value or 0
     epoch_snapshots = {}
     for k, v in api.query_map('Validator', 'DelegationSnapshots'):
-        kv = k.value if hasattr(k, 'value') else k
-        if kv[0] == current_epoch:
+        # query_map yields a raw tuple of ScaleObj elements; each element needs
+        # its own .value to get a plain Python int / SS58 string.
+        k_tuple = k.value if hasattr(k, 'value') else k
+        epoch = k_tuple[0].value if hasattr(k_tuple[0], 'value') else k_tuple[0]
+        op    = k_tuple[1].value if hasattr(k_tuple[1], 'value') else k_tuple[1]
+        if epoch == current_epoch:
             snap = v.value if hasattr(v, 'value') else v
-            epoch_snapshots[kv[1]] = snap
+            epoch_snapshots[op] = snap
 
     return (current_block, block_timestamp, vanity_map, all_reputations, all_heartbeats,
             authorities, active_bidders, all_versions, current_epoch, current_bond,
