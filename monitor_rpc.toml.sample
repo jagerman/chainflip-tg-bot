@@ -1,7 +1,8 @@
 [telegram]
-# Telegram bot token. Can be the same as monitor_validators.toml's token —
-# this script is send-only (does not poll for updates), so it won't conflict
-# with another bot using the same token.
+# Telegram bot token for the RPC monitor. Must be a different bot from the
+# validator monitor — both bots poll Telegram for updates (the RPC monitor
+# handles /status), and Telegram only permits one consumer of getUpdates
+# per token. Create a separate bot via @BotFather.
 bot_token = ""
 
 # Single chat to send alerts to (a DM chat id).

@@ -16,8 +16,12 @@ Chainflip RPC endpoint monitor.
 
 Periodically polls block heights on a set of internal/external RPC endpoints
 for btc/eth/arb/sol/dot/hub/tron, compares against public ground-truth RPCs,
-and sends Telegram alerts on state transitions. Send-only — does not poll
-Telegram for updates, so it can safely share a bot token with other bots.
+and sends Telegram alerts on state transitions. Also exposes a `/status`
+command that reports the current state of every monitored endpoint.
+
+Needs its own Telegram bot token (separate from monitor_validators.py) since
+both bots poll for updates and Telegram allows only one consumer of
+getUpdates per token.
 
 Severity model: at each poll we observe max_h (the highest height reported by
 any of our endpoints or the ground-truth RPC) and append it to a per-chain
@@ -42,8 +46,9 @@ from collections import deque
 from pathlib import Path
 
 import aiohttp
-from telegram import Bot
+from telegram import BotCommand, Update
 from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logging.getLogger('httpx').setLevel(logging.WARNING)
@@ -162,30 +167,43 @@ async def fetch_height(client, kind, url):
 
 def evaluate_endpoint(state, chain, name, result, history, now,
                       thresholds, reminder_interval, min_consecutive_failures):
-    """Update in-memory state for one endpoint; return alert_msg or None.
+    """Update in-memory state for one endpoint; return (msg, is_recovery) or None.
 
     `history` is the chain's ring buffer of (time, max_h) checkpoints. The
     endpoint's "time behind" is the age of the oldest checkpoint it hasn't
     reached — so the chain head has to advance forward of the endpoint for
     the *threshold duration* before we trigger, and the endpoint has to
-    catch up to a checkpoint at least *threshold* seconds old to recover."""
+    catch up to a checkpoint at least *threshold* seconds old to recover.
+
+    is_recovery is True when severity transitions downward (toward ok).
+    The chain_loop uses this to coalesce simultaneous recoveries into one
+    message and append a remaining-issues summary."""
     key = (chain, name)
     s = state.get(key)
     if s is None:
-        s = {'severity': 'ok', 'last_reminder': 0, 'consecutive_failures': 0}
+        s = {
+            'severity': 'ok', 'last_reminder': 0, 'consecutive_failures': 0,
+            'last_height': None, 'last_height_time': None,
+            'time_behind': 0, 'target_height': None,
+            'last_error': None,
+        }
         state[key] = s
 
     if isinstance(result, Exception):
         s['consecutive_failures'] += 1
+        s['last_error'] = fmt_error(result)
         # Tolerate transient request failures (e.g. one-off 502s, brief upstream
         # blips). Only escalate to critical once we've seen `min_consecutive_failures`
         # in a row. The warning log in poll_chain still records every failure.
         if s['consecutive_failures'] < min_consecutive_failures:
             return None
         new_severity = 'critical'
-        reason = f'unreachable ({s["consecutive_failures"]} polls) — {fmt_error(result)}'
+        reason = f'unreachable ({s["consecutive_failures"]} polls) — {s["last_error"]}'
     else:
         s['consecutive_failures'] = 0
+        s['last_error'] = None
+        s['last_height'] = result
+        s['last_height_time'] = now
 
         # Walk the chain history oldest → newest and find the first checkpoint
         # this endpoint hasn't reached. Its age is our "time behind".
@@ -200,9 +218,13 @@ def evaluate_endpoint(state, chain, name, result, history, now,
             new_severity = severity_for_time(time_behind, thresholds)
             reason = (f'height {result}, target {target_height} '
                       f'from {fmt_secs(time_behind)} ago')
+            s['time_behind']   = time_behind
+            s['target_height'] = target_height
         else:
             new_severity = 'ok'
             reason = f'height {result}'
+            s['time_behind']   = 0
+            s['target_height'] = None
 
     prev_severity = s['severity']
     s['severity'] = new_severity
@@ -210,14 +232,16 @@ def evaluate_endpoint(state, chain, name, result, history, now,
     if new_severity != prev_severity:
         if SEVERITY_RANK[new_severity] > SEVERITY_RANK[prev_severity]:
             msg = f'{e(new_severity)} <b>{chain}/{name}</b> {new_severity.upper()}: {reason}'
+            is_recovery = False
         else:
             msg = f'{e(new_severity)} <b>{chain}/{name}</b> recovered: {reason}'
+            is_recovery = True
         if new_severity != 'ok':
             s['last_reminder'] = now
-        return msg
+        return msg, is_recovery
     if new_severity == 'critical' and (now - s['last_reminder']) >= reminder_interval:
         s['last_reminder'] = now
-        return f'{e("critical")} <b>{chain}/{name}</b> still CRITICAL (reminder): {reason}'
+        return f'{e("critical")} <b>{chain}/{name}</b> still CRITICAL (reminder): {reason}', False
     return None
 
 # ── Poll loop ────────────────────────────────────────────────────────────────
@@ -258,19 +282,31 @@ async def poll_chain(client, state, history, chain, thresholds, reminder_interva
         while history and history[0][0] < horizon:
             history.popleft()
 
-    alerts = []
+    alerts = []  # list of (msg, is_recovery)
     for name in endpoints:
-        msg = evaluate_endpoint(
+        result = evaluate_endpoint(
             state, chain, name, results[name], history, now, thresholds, reminder_interval,
             min_consecutive_failures,
         )
-        if msg:
-            alerts.append(msg)
+        if result is not None:
+            alerts.append(result)
     return alerts
+
+def _remaining_issues(state):
+    """Sorted list of 'chain/name' for every endpoint not currently in ok severity."""
+    return sorted(
+        f'{chain}/{name}'
+        for (chain, name), s in state.items()
+        if s.get('severity') and s['severity'] != 'ok'
+    )
 
 async def chain_loop(chain, interval, client, state, thresholds, reminder_interval,
                     min_consecutive_failures, send):
-    """Per-chain forever-loop: poll → send alerts → sleep."""
+    """Per-chain forever-loop: poll → send alerts → sleep.
+
+    Recoveries from the same poll are coalesced into a single message with a
+    remaining-issues tail (count + names, or 'all clear'). Escalations and
+    reminders go out as separate messages."""
     log.info(f'{chain}: polling every {interval}s')
     history = deque()
     while True:
@@ -280,8 +316,26 @@ async def chain_loop(chain, interval, client, state, thresholds, reminder_interv
         except Exception as ex:
             log.error(f'{chain}: poll error: {ex}', exc_info=True)
             alerts = []
-        for msg in alerts:
+
+        recoveries = [m for m, is_rec in alerts if is_rec]
+        others     = [m for m, is_rec in alerts if not is_rec]
+
+        if recoveries:
+            remaining = _remaining_issues(state)
+            body = '\n'.join(recoveries)
+            if not remaining:
+                tail = '<i>(all clear — every monitored endpoint is healthy)</i>'
+            else:
+                shown = remaining[:6]
+                names = ', '.join(shown)
+                if len(remaining) > len(shown):
+                    names += f', +{len(remaining) - len(shown)} more'
+                tail = f'<i>({len(remaining)} endpoint{"s" if len(remaining) != 1 else ""} still affected: {names})</i>'
+            await send(body + '\n\n' + tail)
+
+        for msg in others:
             await send(msg)
+
         await asyncio.sleep(interval)
 
 # ── Telegram sender ──────────────────────────────────────────────────────────
@@ -336,7 +390,71 @@ def load_config(config_path):
 
     return config
 
-async def main_async(config_path):
+# ── Telegram command handlers ────────────────────────────────────────────────
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply with a snapshot of every monitored endpoint's current state."""
+    state = context.bot_data['state']
+    now = time.time()
+
+    if not state:
+        await update.message.reply_text(
+            '⏳ No data yet — bot just started, first polls in progress.',
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Group by chain in the canonical ENDPOINTS order.
+    lines = []
+    overall = 'ok'
+    for chain in ENDPOINTS:
+        chain_entries = [(name, s) for (c, name), s in state.items() if c == chain]
+        if not chain_entries:
+            continue
+        chain_severity = 'ok'
+        for _, s in chain_entries:
+            sev = s.get('severity') or 'ok'
+            if SEVERITY_RANK[sev] > SEVERITY_RANK[chain_severity]:
+                chain_severity = sev
+        if SEVERITY_RANK[chain_severity] > SEVERITY_RANK[overall]:
+            overall = chain_severity
+        lines.append(f'{e(chain_severity)} <b>{chain}</b>')
+
+        # Endpoints in ENDPOINTS' configured order
+        for name in ENDPOINTS[chain]:
+            s = state.get((chain, name))
+            if not s:
+                lines.append(f'    ⚪ {name}: <i>not yet polled</i>')
+                continue
+            sev = s.get('severity') or 'ok'
+            h = s.get('last_height')
+            age = now - s['last_height_time'] if s.get('last_height_time') else None
+            if s.get('last_error') and sev != 'ok':
+                lines.append(f'    {e(sev)} {name}: <i>{s["last_error"]}</i>')
+            elif sev == 'ok':
+                tail = f' ({fmt_secs(age)} ago)' if age and age > 5 else ''
+                lines.append(f'    {e(sev)} {name}: {h}{tail}')
+            else:
+                tb = s.get('time_behind') or 0
+                tgt = s.get('target_height')
+                tgt_str = f', target {tgt}' if tgt else ''
+                lines.append(f'    {e(sev)} {name}: {h}{tgt_str} ({fmt_secs(tb)} behind)')
+
+    body = '\n'.join(lines) if lines else '<i>(no endpoints configured)</i>'
+    head = f'{e(overall)} <b>Chainflip RPC Status</b> — {time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(now))}'
+    await update.message.reply_text(
+        head + '\n\n' + body,
+        parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+    )
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).with_suffix('.toml')
+    if not config_path.exists():
+        print(f'Error: config file not found: {config_path}', file=sys.stderr)
+        sys.exit(1)
+
     config = load_config(config_path)
 
     if not ENDPOINTS:
@@ -356,7 +474,6 @@ async def main_async(config_path):
 
     thresholds = dict(DEFAULT_THRESHOLDS)
     thresholds.update(config.get('thresholds', {}))
-    # Sanity: warning <= alert <= critical
     if not (thresholds['warning'] <= thresholds['alert'] <= thresholds['critical']):
         log.warning(f'thresholds out of order: {thresholds}')
 
@@ -366,35 +483,52 @@ async def main_async(config_path):
     EMOJI['alert']    = emoji_cfg.get('alert',    '🟠')
     EMOJI['critical'] = emoji_cfg.get('critical', '🔴')
 
-    state = {}  # (chain, endpoint) -> {last_height, target_height, target_time, severity, last_reminder}
-    bot = Bot(token=bot_token)
-    alert_queue: asyncio.Queue[str] = asyncio.Queue()
+    state = {}  # (chain, endpoint) -> per-endpoint dict (see evaluate_endpoint)
 
-    async def send(msg):
-        # Polling tasks just enqueue — the sender_task below handles delivery
-        # with retry+backoff so a transient outbound-network hiccup on this
-        # host doesn't silently drop the alert it produced.
-        await alert_queue.put(msg)
+    app = Application.builder().token(bot_token).build()
+    app.bot_data['state']   = state
+    app.bot_data['chat_id'] = chat_id
 
-    timeout = aiohttp.ClientTimeout(total=request_timeout)
-    async with aiohttp.ClientSession(timeout=timeout) as client:
-        log.info(f'RPC monitor started (thresholds {thresholds}).')
-        sender = asyncio.create_task(sender_task(alert_queue, bot, chat_id))
-        loops = [
+    app.add_handler(CommandHandler('status', cmd_status))
+
+    async def post_init(app):
+        await app.bot.set_my_commands([
+            BotCommand('status', 'Show current status of all monitored RPC endpoints'),
+        ])
+
+        timeout = aiohttp.ClientTimeout(total=request_timeout)
+        client = aiohttp.ClientSession(timeout=timeout)
+        alert_queue: asyncio.Queue[str] = asyncio.Queue()
+
+        async def send(msg):
+            # Polling tasks just enqueue — sender_task below handles delivery
+            # with retry+backoff so a transient outbound network hiccup on
+            # this host doesn't silently drop the alert.
+            await alert_queue.put(msg)
+
+        app.bot_data['client'] = client
+        app.bot_data['monitor_tasks'] = [
+            asyncio.create_task(sender_task(alert_queue, app.bot, chat_id))
+        ] + [
             asyncio.create_task(
                 chain_loop(chain, intervals[chain], client, state, thresholds,
                            reminder_interval, min_consecutive_failures, send)
             )
             for chain in ENDPOINTS
         ]
-        await asyncio.gather(sender, *loops)
+        log.info(f'RPC monitor started (thresholds {thresholds}).')
 
-def main():
-    config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).with_suffix('.toml')
-    if not config_path.exists():
-        print(f'Error: config file not found: {config_path}', file=sys.stderr)
-        sys.exit(1)
-    asyncio.run(main_async(config_path))
+    async def post_shutdown(app):
+        for task in app.bot_data.get('monitor_tasks', []):
+            task.cancel()
+        client = app.bot_data.get('client')
+        if client is not None:
+            await client.close()
+
+    app.post_init = post_init
+    app.post_shutdown = post_shutdown
+
+    app.run_polling()
 
 if __name__ == '__main__':
     main()

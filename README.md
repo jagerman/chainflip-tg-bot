@@ -3,7 +3,7 @@
 This repo contains two Telegram bots:
 
 1. **Validator Monitor** (`monitor_validators.py`) — multi-user bot that watches Chainflip operators/validators for health issues (offline, reputation drops, aggregate failures). Users register operator addresses via Telegram commands.
-2. **RPC Endpoint Monitor** (`monitor_rpc.py`) — send-only daemon that watches block heights across your btc/eth/arb/sol/dot/hub/tron RPC endpoints (and a public ground-truth source per chain), DM-alerting on lag/unreachability. See [RPC Endpoint Monitor](#rpc-endpoint-monitor-companion-bot) below.
+2. **RPC Endpoint Monitor** (`monitor_rpc.py`) — daemon that watches block heights across your btc/eth/arb/sol/dot/hub/tron RPC endpoints (and a public ground-truth source per chain), DM-alerting on lag/unreachability. Also exposes a `/status` command. See [RPC Endpoint Monitor](#rpc-endpoint-monitor-companion-bot) below.
 
 ## Validator Monitor
 
@@ -149,11 +149,13 @@ See `monitor_validators.toml.sample` for all options:
 
 ## RPC Endpoint Monitor (companion bot)
 
-A second, send-only daemon — `monitor_rpc.py` — that polls block heights on btc/eth/arb/sol/dot/hub/tron across multiple RPC endpoints (your own + a public ground-truth source per chain) and alerts when an endpoint falls behind or becomes unreachable. Unlike the validator monitor, it sends to a single hardcoded chat: alerts arrive in your DM, no `/register` flow.
+A second daemon — `monitor_rpc.py` — that polls block heights on btc/eth/arb/sol/dot/hub/tron across multiple RPC endpoints (your own + a public ground-truth source per chain), alerts when an endpoint falls behind or becomes unreachable, and exposes a `/status` command summarising every monitored endpoint's current state. Alerts go to one hardcoded chat (DM).
 
 ### Setup
 
-It's send-only (never calls `getUpdates`), so it can share the same Telegram bot token as the validator monitor — Telegram only restricts polling consumers per token, not senders. No `/setcommands` needed.
+Create a **separate** Telegram bot via [@BotFather](https://t.me/BotFather) — the RPC monitor polls Telegram for updates to handle `/status`, and Telegram only permits one consumer of `getUpdates` per token, so it can't share a token with the validator monitor.
+
+The bot registers its own command list via `setMyCommands` on startup, so no manual `/setcommands` step in BotFather is needed.
 
 ```bash
 # Install the scripts and service (after the validator monitor setup above)
