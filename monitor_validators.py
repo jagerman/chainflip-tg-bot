@@ -39,7 +39,7 @@ from pathlib import Path
 from eth_utils import is_address, to_checksum_address
 from substrateinterface import SubstrateInterface
 from scalecodec.utils.ss58 import ss58_encode
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
+from telegram import BotCommand, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 
@@ -1155,6 +1155,13 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_unwallet,   pattern='^unwal:'))
 
     async def post_init(app):
+        await app.bot.set_my_commands([
+            BotCommand('status',     'Show current status of monitored operators'),
+            BotCommand('register',   'Monitor a Chainflip operator (provide address)'),
+            BotCommand('unregister', 'Stop monitoring an operator'),
+            BotCommand('wallet',     'Track a delegator wallet (0x… address, optional label)'),
+            BotCommand('unwallet',   'Remove a tracked wallet'),
+        ])
         app.bot_data['loop'] = asyncio.get_event_loop()
         app.bot_data['monitor_task'] = asyncio.create_task(
             monitor_loop(app, conn, monitor_api, poll_interval, reminder_interval)

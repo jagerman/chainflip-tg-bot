@@ -13,15 +13,7 @@ A Telegram bot that monitors Chainflip validator nodes for operators. Users can 
 
 ### 1. Create a Telegram bot
 
-Message [@BotFather](https://t.me/BotFather) on Telegram:
-- Send `/newbot` and follow the prompts to get a bot token.
-- Send `/setcommands`, select your bot, and paste:
-  ```
-  start - Welcome message and command list
-  register - Monitor an operator (provide address)
-  unregister - Stop monitoring an operator
-  status - Show current validator status
-  ```
+Message [@BotFather](https://t.me/BotFather) on Telegram and send `/newbot` to get a bot token. The bot registers its own command list via `setMyCommands` on startup, so no manual `/setcommands` step is needed.
 
 ### 2. Install dependencies
 
