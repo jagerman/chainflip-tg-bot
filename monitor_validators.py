@@ -71,6 +71,11 @@ CHAINFLIP_SS58_PREFIX = 2112
 # Severity levels in ascending order — populated from config at startup
 EMOJI = {}  # ok / warning / alert / critical -> str
 
+# Optional "quiet hours" window during which persistent-critical *reminders*
+# are suppressed (transition alerts still fire). Tuple of ((start_h, start_m),
+# (end_h, end_m)) in the host's local time, or None to disable.
+SLEEP_WINDOW = None
+
 SEVERITY_RANK = {'ok': 0, 'warning': 1, 'alert': 2, 'critical': 3}
 
 def worst(*severities):
@@ -153,6 +158,11 @@ def db_connect(path):
             alert_alert       INTEGER  DEFAULT 0,
             alert_critical    INTEGER  DEFAULT 0,
             last_reminder     REAL     DEFAULT 0,
+            -- Acknowledgement flags: when set (by a user tapping the ack
+            -- button on an alert), future reminders for that condition are
+            -- suppressed until the condition transitions.
+            ack_offline       INTEGER  DEFAULT 0,
+            ack_critical      INTEGER  DEFAULT 0,
             -- Snapshot of the reputation value the last time it changed, and
             -- when that change happened. Used to display the trend.
             last_change_rep   INTEGER,
@@ -161,11 +171,12 @@ def db_connect(path):
         );
 
         CREATE TABLE IF NOT EXISTS operator_state (
-            chat_id           INTEGER,
-            operator          TEXT,
+            chat_id            INTEGER,
+            operator           TEXT,
             alert_alert_agg    INTEGER DEFAULT 0,
             alert_critical_agg INTEGER DEFAULT 0,
             last_reminder      REAL    DEFAULT 0,
+            ack_critical_agg   INTEGER DEFAULT 0,
             PRIMARY KEY (chat_id, operator)
         );
 
@@ -182,6 +193,13 @@ def db_connect(path):
         conn.execute('ALTER TABLE validator_state ADD COLUMN last_change_rep INTEGER')
     if 'last_change_time' not in existing:
         conn.execute('ALTER TABLE validator_state ADD COLUMN last_change_time REAL')
+    if 'ack_offline' not in existing:
+        conn.execute('ALTER TABLE validator_state ADD COLUMN ack_offline INTEGER DEFAULT 0')
+    if 'ack_critical' not in existing:
+        conn.execute('ALTER TABLE validator_state ADD COLUMN ack_critical INTEGER DEFAULT 0')
+    op_existing = {row['name'] for row in conn.execute('PRAGMA table_info(operator_state)').fetchall()}
+    if 'ack_critical_agg' not in op_existing:
+        conn.execute('ALTER TABLE operator_state ADD COLUMN ack_critical_agg INTEGER DEFAULT 0')
     # Track the most recent epoch we've already done the epoch-dropout check for,
     # per (chat_id, operator). Set to the chain's current epoch on first install
     # so we don't alert about all-historic dropouts the first time the daemon runs.
@@ -415,6 +433,8 @@ def process_validator(conn, chat_id, operator, validator, online, reputation, no
     was_alert        = bool(row['alert_alert'])
     was_critical     = bool(row['alert_critical'])
     last_reminder    = row['last_reminder']
+    ack_offline      = bool(row['ack_offline'])
+    ack_critical     = bool(row['ack_critical'])
     last_change_rep  = row['last_change_rep']
     last_change_time = row['last_change_time']
 
@@ -471,12 +491,22 @@ def process_validator(conn, chat_id, operator, validator, online, reputation, no
     elif not new_warning and was_warning:
         alerts.append(('ok', f'{e("ok")} Reputation recovered above {REP_WARNING}: {reputation}'))
 
+    # Any transition (on OR off) clears the ack flag for that condition, so a
+    # re-escalation isn't silenced by an old acknowledgement.
+    if new_offline != was_offline:
+        ack_offline = False
+    if new_critical != was_critical:
+        ack_critical = False
+
     # ── Reminders for persistent CRITICAL conditions ────────────────────────
-    is_critical_condition = new_offline or new_critical
-    if is_critical_condition and not alerts and (now - last_reminder) >= reminder_interval:
-        if new_offline:
+    # A condition is remindable only if the user hasn't acknowledged it since
+    # the last state change.
+    remind_offline  = new_offline  and not ack_offline
+    remind_critical = new_critical and not ack_critical
+    if (remind_offline or remind_critical) and not alerts and (now - last_reminder) >= reminder_interval:
+        if remind_offline:
             alerts.append(('critical', f'{e("critical")} Still <b>OFFLINE</b> (reminder)'))
-        if new_critical:
+        if remind_critical:
             alerts.append(('critical', f'{e("critical")} Reputation still CRITICAL: {reputation} (reminder)'))
 
     if alerts:
@@ -486,12 +516,14 @@ def process_validator(conn, chat_id, operator, validator, online, reputation, no
         UPDATE validator_state
         SET reputation=?, consecutive_drops=?,
             alert_offline=?, alert_warning=?, alert_alert=?, alert_critical=?,
-            last_reminder=?, last_change_rep=?, last_change_time=?
+            last_reminder=?, ack_offline=?, ack_critical=?,
+            last_change_rep=?, last_change_time=?
         WHERE chat_id=? AND operator=? AND validator=?
     ''', (
         reputation, cons_drops,
         int(new_offline), int(new_warning), int(new_alert), int(new_critical),
-        last_reminder, last_change_rep, last_change_time,
+        last_reminder, int(ack_offline), int(ack_critical),
+        last_change_rep, last_change_time,
         chat_id, operator, validator
     ))
     conn.commit()
@@ -529,6 +561,7 @@ def process_operator_aggregates(conn, chat_id, operator, validator_reps, now, re
     was_alert_agg    = bool(row['alert_alert_agg'])
     was_critical_agg = bool(row['alert_critical_agg'])
     last_reminder    = row['last_reminder']
+    ack_critical_agg = bool(row['ack_critical_agg'])
 
     alerts = []
 
@@ -542,8 +575,12 @@ def process_operator_aggregates(conn, chat_id, operator, validator_reps, now, re
     elif not new_alert_agg and was_alert_agg:
         alerts.append(('ok', f'{e("ok")} Aggregate recovered: fewer than half below {REP_WARNING}'))
 
-    # Reminder for persistent critical aggregate
-    if new_critical_agg and not alerts and (now - last_reminder) >= reminder_interval:
+    # Any transition clears the ack so re-escalations aren't silenced.
+    if new_critical_agg != was_critical_agg:
+        ack_critical_agg = False
+
+    # Reminder for persistent critical aggregate (only if not acknowledged).
+    if new_critical_agg and not ack_critical_agg and not alerts and (now - last_reminder) >= reminder_interval:
         alerts.append(('critical', f'{e("critical")} Still aggregate CRITICAL: {below_alert}/{total} below {REP_ALERT} (reminder)'))
 
     if alerts:
@@ -551,9 +588,9 @@ def process_operator_aggregates(conn, chat_id, operator, validator_reps, now, re
 
     conn.execute('''
         UPDATE operator_state
-        SET alert_alert_agg=?, alert_critical_agg=?, last_reminder=?
+        SET alert_alert_agg=?, alert_critical_agg=?, last_reminder=?, ack_critical_agg=?
         WHERE chat_id=? AND operator=?
-    ''', (int(new_alert_agg), int(new_critical_agg), last_reminder, chat_id, operator))
+    ''', (int(new_alert_agg), int(new_critical_agg), last_reminder, int(ack_critical_agg), chat_id, operator))
     conn.commit()
 
     return alerts
@@ -794,12 +831,32 @@ def run_poll(app, conn, api, reminder_interval):
 
         lines = [f'{e(global_severity)} <b>Chainflip Alert</b> — {op_link(operator, vanity_map)} (block {current_block}, {relative_time(block_timestamp)})\n']
 
+        # Track critical-severity subjects so we can offer an ack button for
+        # each; a single button per validator (acks both offline + rep-crit),
+        # plus one for aggregate-critical if that fired.
+        critical_validators = {}   # validator_addr -> display name
+        aggregate_critical = False
+
         for severity, name, validator, msg in chat_alerts:
             if name and validator:
                 link = f'<a href="{SCAN_VALIDATOR}/{validator}">{name}</a>'
                 lines.append(f'{link}: {msg}')
             else:
                 lines.append(msg)
+            if severity == 'critical':
+                if validator:
+                    critical_validators.setdefault(validator, name or short_addr(validator))
+                elif name is None:
+                    aggregate_critical = True
+
+        buttons = [
+            [InlineKeyboardButton(f'🔕 Ack {name}', callback_data=f'ackv:{validator}')]
+            for validator, name in sorted(critical_validators.items(), key=lambda kv: kv[1])
+        ]
+        if aggregate_critical:
+            buttons.append([InlineKeyboardButton('🔕 Ack aggregate',
+                                                 callback_data=f'ackop:{operator}')])
+        reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
 
         asyncio.run_coroutine_threadsafe(
             app.bot.send_message(
@@ -807,6 +864,7 @@ def run_poll(app, conn, api, reminder_interval):
                 text='\n'.join(lines),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
+                reply_markup=reply_markup,
             ),
             app.bot_data['loop'],
         )
@@ -1049,6 +1107,36 @@ async def callback_unwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
     )
 
+async def callback_ack_validator(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Acknowledge current critical conditions (offline and/or rep-critical) for
+    one specific validator. Silences reminders until the condition transitions."""
+    conn = context.bot_data['conn']
+    query = update.callback_query
+    validator = query.data.removeprefix('ackv:')
+    chat_id = query.message.chat_id
+    conn.execute('''
+        UPDATE validator_state
+        SET ack_offline  = alert_offline,
+            ack_critical = alert_critical
+        WHERE chat_id=? AND validator=?
+    ''', (chat_id, validator))
+    conn.commit()
+    await query.answer('Acknowledged — reminders silenced until state changes')
+
+async def callback_ack_aggregate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Acknowledge the aggregate-critical condition for one operator."""
+    conn = context.bot_data['conn']
+    query = update.callback_query
+    operator = query.data.removeprefix('ackop:')
+    chat_id = query.message.chat_id
+    conn.execute('''
+        UPDATE operator_state
+        SET ack_critical_agg = alert_critical_agg
+        WHERE chat_id=? AND operator=?
+    ''', (chat_id, operator))
+    conn.commit()
+    await query.answer('Acknowledged — reminders silenced until state changes')
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn    = context.bot_data['conn']
     api     = context.bot_data['api']
@@ -1151,8 +1239,10 @@ def main():
         filters.REPLY & filters.TEXT & ~filters.COMMAND,
         handle_force_reply,
     ))
-    app.add_handler(CallbackQueryHandler(callback_unregister, pattern='^unreg:'))
-    app.add_handler(CallbackQueryHandler(callback_unwallet,   pattern='^unwal:'))
+    app.add_handler(CallbackQueryHandler(callback_unregister,     pattern='^unreg:'))
+    app.add_handler(CallbackQueryHandler(callback_unwallet,       pattern='^unwal:'))
+    app.add_handler(CallbackQueryHandler(callback_ack_validator,  pattern='^ackv:'))
+    app.add_handler(CallbackQueryHandler(callback_ack_aggregate,  pattern='^ackop:'))
 
     async def post_init(app):
         await app.bot.set_my_commands([
