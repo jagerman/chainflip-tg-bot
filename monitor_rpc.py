@@ -216,8 +216,10 @@ def evaluate_endpoint(state, chain, name, result, history, now,
         if target_time is not None:
             time_behind  = now - target_time
             new_severity = severity_for_time(time_behind, thresholds)
+            blocks_behind = target_height - result
             reason = (f'height {result}, target {target_height} '
-                      f'from {fmt_secs(time_behind)} ago')
+                      f'from {fmt_secs(time_behind)} ago '
+                      f'({blocks_behind} block{"s" if blocks_behind != 1 else ""} behind)')
             s['time_behind']   = time_behind
             s['target_height'] = target_height
         else:
