@@ -33,6 +33,12 @@ has been met, i.e. the endpoint is current with the chain head as observed
 warning_threshold seconds ago (not just with the chain head from whenever the
 last warning happened to fire).
 
+Optional quiet hours hold back everything below critical, and hold critical
+itself until the endpoint has been continuously unhealthy (behind or
+unreachable, either one) for min_failure_seconds. An overnight VPN blip that
+heals itself is then never mentioned at all, while a genuine sustained outage
+still is.
+
 Usage:
   ./monitor_rpc.py [config_file]
 """
@@ -46,6 +52,7 @@ from collections import deque
 from pathlib import Path
 
 import aiohttp
+import pendulum
 from telegram import BotCommand, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -117,6 +124,54 @@ def fmt_secs(seconds):
         return f'{int(seconds // 60)}m{int(seconds % 60):02d}s'
     return f'{int(seconds // 3600)}h{int((seconds % 3600) // 60):02d}m'
 
+def fmt_hhmm(minutes):
+    return f'{minutes // 60:02d}:{minutes % 60:02d}'
+
+def parse_hhmm(value, what):
+    """Parse a quiet-hours boundary into minutes since midnight.
+
+    Accepts "HH:MM"/"H" strings, a bare integer hour, or the datetime.time that
+    tomllib produces for an unquoted TOML local time (e.g. `start = 02:00:00`)."""
+    if hasattr(value, 'hour'):
+        h, m = value.hour, value.minute
+    elif isinstance(value, int):
+        h, m = value, 0
+    else:
+        parts = str(value).split(':')
+        h, m = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+    if not (0 <= h < 24 and 0 <= m < 60):
+        raise ValueError(f'quiet_hours.{what}: not a valid time of day: {value!r}')
+    return 60 * h + m
+
+def in_quiet_hours(now, quiet):
+    """True if the unix timestamp `now` falls inside the configured quiet window.
+
+    Handles both a same-day window (02:00–11:00) and one that wraps past
+    midnight (23:00–09:00). The end boundary is exclusive so that end == start
+    would mean an empty window rather than an ambiguous all-day one;
+    load_quiet_hours rejects that case rather than leaving it to chance."""
+    local = pendulum.from_timestamp(now, tz=quiet['tz'])
+    minutes = 60 * local.hour + local.minute
+    start, end = quiet['start'], quiet['end']
+    if start < end:
+        return start <= minutes < end
+    return minutes >= start or minutes < end
+
+def load_quiet_hours(cfg):
+    """Parse the [quiet_hours] config section, or return None if not configured."""
+    if not cfg:
+        return None
+    quiet = {
+        'start': parse_hhmm(cfg['start'], 'start'),
+        'end':   parse_hhmm(cfg['end'],   'end'),
+        'tz':    pendulum.timezone(cfg['timezone']) if 'timezone' in cfg else 'local',
+        'min_failure_seconds': cfg.get('min_failure_seconds', 300),
+    }
+    if quiet['start'] == quiet['end']:
+        log.warning('quiet_hours: start == end, disabling quiet hours')
+        return None
+    return quiet
+
 def fmt_error(ex):
     """Render an exception as a concise one-line summary.
     aiohttp's str() already includes the underlying cause (DNS error, refused
@@ -165,8 +220,26 @@ async def fetch_height(client, kind, url):
 
 # ── Per-endpoint evaluation ──────────────────────────────────────────────────
 
+def reportable_severity(s, severity, now, quiet_hours):
+    """The severity we're currently willing to notify about.
+
+    Outside quiet hours this is just the real severity. Inside them we hold
+    back everything below critical, and hold critical too until the endpoint
+    has been continuously unhealthy for min_failure_seconds — so a VPN blip
+    that heals itself overnight produces no message at all, not even a
+    recovery. Deliberately keyed on `not_ok_since` rather than on how long the
+    endpoint has been *critical*, so a slow slide warning → alert → critical
+    counts the whole degradation, not just its last stage."""
+    if quiet_hours is None or not in_quiet_hours(now, quiet_hours):
+        return severity
+    if severity != 'critical' or s['not_ok_since'] is None:
+        return 'ok'
+    if now - s['not_ok_since'] < quiet_hours['min_failure_seconds']:
+        return 'ok'
+    return severity
+
 def evaluate_endpoint(state, chain, name, result, history, now,
-                      thresholds, reminder_interval, min_consecutive_failures):
+                      thresholds, reminder_interval, min_consecutive_failures, quiet_hours):
     """Update in-memory state for one endpoint; return (msg, is_recovery) or None.
 
     `history` is the chain's ring buffer of (time, max_h) checkpoints. The
@@ -182,7 +255,8 @@ def evaluate_endpoint(state, chain, name, result, history, now,
     s = state.get(key)
     if s is None:
         s = {
-            'severity': 'ok', 'last_reminder': 0, 'consecutive_failures': 0,
+            'severity': 'ok', 'reported': 'ok', 'last_reminder': 0,
+            'consecutive_failures': 0, 'not_ok_since': None,
             'last_height': None, 'last_height_time': None,
             'time_behind': 0, 'target_height': None,
             'last_error': None,
@@ -192,13 +266,16 @@ def evaluate_endpoint(state, chain, name, result, history, now,
     if isinstance(result, Exception):
         s['consecutive_failures'] += 1
         s['last_error'] = fmt_error(result)
+        if s['not_ok_since'] is None:
+            s['not_ok_since'] = now
         # Tolerate transient request failures (e.g. one-off 502s, brief upstream
         # blips). Only escalate to critical once we've seen `min_consecutive_failures`
         # in a row. The warning log in poll_chain still records every failure.
         if s['consecutive_failures'] < min_consecutive_failures:
             return None
         new_severity = 'critical'
-        reason = f'unreachable ({s["consecutive_failures"]} polls) — {s["last_error"]}'
+        reason = (f'unreachable for {fmt_secs(now - s["not_ok_since"])} '
+                  f'({s["consecutive_failures"]} polls) — {s["last_error"]}')
     else:
         s['consecutive_failures'] = 0
         s['last_error'] = None
@@ -228,27 +305,39 @@ def evaluate_endpoint(state, chain, name, result, history, now,
             s['time_behind']   = 0
             s['target_height'] = None
 
-    prev_severity = s['severity']
     s['severity'] = new_severity
+    if new_severity == 'ok':
+        s['not_ok_since'] = None
+    elif s['not_ok_since'] is None:
+        s['not_ok_since'] = now
 
-    if new_severity != prev_severity:
-        if SEVERITY_RANK[new_severity] > SEVERITY_RANK[prev_severity]:
-            msg = f'{e(new_severity)} <b>{chain}/{name}</b> {new_severity.upper()}: {reason}'
+    # Transitions are tracked against what we last *told* the user, not against
+    # the real severity, so an alert held back by quiet hours still fires when
+    # it eventually qualifies (or when quiet hours end), instead of being
+    # swallowed because the real severity changed while we were staying silent.
+    prev_reported = s['reported']
+    reported = reportable_severity(s, new_severity, now, quiet_hours)
+    s['reported'] = reported
+
+    if reported != prev_reported:
+        if SEVERITY_RANK[reported] > SEVERITY_RANK[prev_reported]:
+            msg = f'{e(reported)} <b>{chain}/{name}</b> {reported.upper()}: {reason}'
             is_recovery = False
         else:
-            msg = f'{e(new_severity)} <b>{chain}/{name}</b> recovered: {reason}'
+            msg = f'{e(reported)} <b>{chain}/{name}</b> recovered: {reason}'
             is_recovery = True
-        if new_severity != 'ok':
+        if reported != 'ok':
             s['last_reminder'] = now
         return msg, is_recovery
-    if new_severity == 'critical' and (now - s['last_reminder']) >= reminder_interval:
+    if reported == 'critical' and (now - s['last_reminder']) >= reminder_interval:
         s['last_reminder'] = now
         return f'{e("critical")} <b>{chain}/{name}</b> still CRITICAL (reminder): {reason}', False
     return None
 
 # ── Poll loop ────────────────────────────────────────────────────────────────
 
-async def poll_chain(client, state, history, chain, thresholds, reminder_interval, min_consecutive_failures):
+async def poll_chain(client, state, history, chain, thresholds, reminder_interval,
+                     min_consecutive_failures, quiet_hours):
     """Poll one chain's endpoints and ground truth. Returns list of alert strings.
 
     `history` is the per-chain deque of (time, max_h) checkpoints; we append
@@ -288,7 +377,7 @@ async def poll_chain(client, state, history, chain, thresholds, reminder_interva
     for name in endpoints:
         result = evaluate_endpoint(
             state, chain, name, results[name], history, now, thresholds, reminder_interval,
-            min_consecutive_failures,
+            min_consecutive_failures, quiet_hours,
         )
         if result is not None:
             alerts.append(result)
@@ -303,7 +392,7 @@ def _remaining_issues(state):
     )
 
 async def chain_loop(chain, interval, client, state, thresholds, reminder_interval,
-                    min_consecutive_failures, send):
+                    min_consecutive_failures, quiet_hours, send):
     """Per-chain forever-loop: poll → send alerts → sleep.
 
     Recoveries from the same poll are coalesced into a single message with a
@@ -314,7 +403,7 @@ async def chain_loop(chain, interval, client, state, thresholds, reminder_interv
     while True:
         try:
             alerts = await poll_chain(client, state, history, chain, thresholds, reminder_interval,
-                                       min_consecutive_failures)
+                                       min_consecutive_failures, quiet_hours)
         except Exception as ex:
             log.error(f'{chain}: poll error: {ex}', exc_info=True)
             alerts = []
@@ -431,8 +520,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sev = s.get('severity') or 'ok'
             h = s.get('last_height')
             age = now - s['last_height_time'] if s.get('last_height_time') else None
+            # Flag states we know about but have stayed quiet on, so /status can
+            # never look like it's contradicting the alerts you did receive.
+            held = ' 🔕' if sev != 'ok' and (s.get('reported') or 'ok') != sev else ''
             if s.get('last_error') and sev != 'ok':
-                lines.append(f'    {e(sev)} {name}: <i>{s["last_error"]}</i>')
+                lines.append(f'    {e(sev)} {name}:{held} <i>{s["last_error"]}</i>')
+            elif sev == 'ok' and s.get('consecutive_failures'):
+                n = s['consecutive_failures']
+                lines.append(f'    {e(sev)} {name}: <i>{n} failed poll{"s" if n != 1 else ""}, '
+                             f'not yet alerting — {s["last_error"]}</i>')
             elif sev == 'ok':
                 tail = f' ({fmt_secs(age)} ago)' if age and age > 5 else ''
                 lines.append(f'    {e(sev)} {name}: {h}{tail}')
@@ -440,10 +536,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tb = s.get('time_behind') or 0
                 tgt = s.get('target_height')
                 tgt_str = f', target {tgt}' if tgt else ''
-                lines.append(f'    {e(sev)} {name}: {h}{tgt_str} ({fmt_secs(tb)} behind)')
+                lines.append(f'    {e(sev)} {name}:{held} {h}{tgt_str} ({fmt_secs(tb)} behind)')
 
     body = '\n'.join(lines) if lines else '<i>(no endpoints configured)</i>'
     head = f'{e(overall)} <b>Chainflip RPC Status</b> — {time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(now))}'
+    quiet = context.bot_data.get('quiet_hours')
+    if quiet is not None and in_quiet_hours(now, quiet):
+        head += (f'\n🔕 <i>Quiet hours until {fmt_hhmm(quiet["end"])} — only critical alerts, and only '
+                 f'after {fmt_secs(quiet["min_failure_seconds"])} of continuous trouble</i>')
     await update.message.reply_text(
         head + '\n\n' + body,
         parse_mode=ParseMode.HTML, disable_web_page_preview=True,
@@ -470,6 +570,7 @@ def main():
     reminder_interval = config['monitoring'].get('reminder_interval_seconds', 3600)
     request_timeout   = config['monitoring'].get('request_timeout_seconds', 10)
     min_consecutive_failures = config['monitoring'].get('min_consecutive_failures', 2)
+    quiet_hours       = load_quiet_hours(config.get('quiet_hours'))
 
     intervals = {c: default_interval for c in ENDPOINTS}
     intervals.update(config.get('poll_intervals', {}))
@@ -488,8 +589,9 @@ def main():
     state = {}  # (chain, endpoint) -> per-endpoint dict (see evaluate_endpoint)
 
     app = Application.builder().token(bot_token).build()
-    app.bot_data['state']   = state
-    app.bot_data['chat_id'] = chat_id
+    app.bot_data['state']       = state
+    app.bot_data['chat_id']     = chat_id
+    app.bot_data['quiet_hours'] = quiet_hours
 
     app.add_handler(CommandHandler('status', cmd_status))
 
@@ -514,11 +616,15 @@ def main():
         ] + [
             asyncio.create_task(
                 chain_loop(chain, intervals[chain], client, state, thresholds,
-                           reminder_interval, min_consecutive_failures, send)
+                           reminder_interval, min_consecutive_failures, quiet_hours, send)
             )
             for chain in ENDPOINTS
         ]
         log.info(f'RPC monitor started (thresholds {thresholds}).')
+        if quiet_hours:
+            log.info(f'Quiet hours {fmt_hhmm(quiet_hours["start"])}–{fmt_hhmm(quiet_hours["end"])} '
+                     f'({quiet_hours["tz"]}): only critical alerts, and only after '
+                     f'{fmt_secs(quiet_hours["min_failure_seconds"])} of continuous trouble')
 
     async def post_shutdown(app):
         for task in app.bot_data.get('monitor_tasks', []):

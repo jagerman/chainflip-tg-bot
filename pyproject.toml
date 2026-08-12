@@ -8,4 +8,5 @@ dependencies = [
     "python-telegram-bot>=22",
     "substrate-interface",
     "requests",
+    "pendulum>=3",
 ]

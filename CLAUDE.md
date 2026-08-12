@@ -87,6 +87,14 @@ Per-endpoint state in memory (no database — restarts cost at most one threshol
 
 This is "did we reach height X within T seconds of seeing it elsewhere", not "how many blocks behind" — block-time agnostic so the same thresholds work for sub-second Arbitrum and 10-minute Bitcoin.
 
+### Quiet hours
+
+Optional `[quiet_hours]` window (`start`/`end` as "HH:MM", optional `timezone`, `min_failure_seconds`). Inside it, warning/alert are never sent, and critical is sent only once the endpoint has been continuously non-ok for `min_failure_seconds` — measured from `not_ok_since`, so a slow warning → alert → critical slide counts the whole degradation rather than restarting at each stage. Both the behind path and the unreachable path go through the same gate.
+
+Each endpoint therefore tracks two severities: `severity` (the truth, what `/status` and `_remaining_issues` report) and `reported` (what the user was last told). Alert transitions are computed against `reported`, which is what makes a held alert still fire when it escalates or when the window ends, and makes a blip that clears inside the window silent end to end — no alert and no orphan recovery message. `/status` marks held states with 🔕.
+
+Times use `pendulum`; `timezone` defaults to the host's local zone. Both same-day (`02:00`–`11:00`) and midnight-wrapping (`23:00`–`09:00`) windows work; the end boundary is exclusive, and `start == end` is rejected at load rather than treated as all-day.
+
 ### Per-chain polling
 
 Each chain runs its own async loop at its own cadence. Default is `monitoring.poll_interval_seconds` (60s) for every chain; override per-chain via `[poll_intervals]` in TOML.

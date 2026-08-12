@@ -17,6 +17,36 @@ request_timeout_seconds    = 10
 # to alert on every single failure. Default 2 hides one-off transients.
 min_consecutive_failures   = 2
 
+# Optional quiet hours, so a brief overnight VPN drop doesn't produce a cascade
+# of 3am notifications while a real sustained outage still does. Within the
+# window:
+#
+#   - warning and alert severities are never sent at all;
+#   - critical is sent only once the endpoint has been continuously unhealthy
+#     for min_failure_seconds, counting from when it first stopped being ok,
+#     whether it's behind or outright unreachable.
+#
+# Anything that clears before that deadline is silent end to end — you get no
+# alert and no matching recovery message. Anything still broken when the window
+# ends alerts immediately at that point, and a held state that escalates to
+# critical mid-window alerts as soon as it qualifies.
+#
+# /status always reports the true current severity regardless of the hour, with
+# a 🔕 marker on states that are being held back.
+#
+# The window may wrap past midnight, so start = "23:00" / end = "09:00" works
+# as you'd expect. end is exclusive; start == end is rejected rather than being
+# treated as an all-day window.
+#
+# Omit this section entirely to disable quiet hours.
+# [quiet_hours]
+# start = "02:00"
+# end   = "11:00"
+# min_failure_seconds = 300
+# # Zone the start/end times are interpreted in. Defaults to the host's local
+# # timezone, which is usually UTC on a server — set this if that isn't you.
+# timezone = "America/Halifax"
+
 # Time-behind thresholds (seconds). An endpoint is considered "behind" until
 # it reaches a height we previously observed elsewhere; severity scales with
 # how long that target has been outstanding.
