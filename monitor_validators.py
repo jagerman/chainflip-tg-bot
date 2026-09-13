@@ -62,6 +62,10 @@ DROPS_WARNING  = 4
 DROPS_ALERT    = 2
 DROPS_CRITICAL = 1
 
+# How many subject names to spell out in the /status bulk-ack button before
+# collapsing the rest into "+N more".
+ACK_BUTTON_NAMES = 4
+
 SCAN_VALIDATOR = 'https://scan.chainflip.io/validators'
 SCAN_OPERATOR  = 'https://scan.chainflip.io/operators'
 
@@ -613,6 +617,9 @@ def format_wallet_line(raw, label, current, upcoming, reward):
     return f'        👉 {name}: {", ".join(parts)}'
 
 def build_status_message_for_user(conn, chat_id, api_data, operator_validators, vanity_map, operator_financials, wallet_delegations=None):
+    """Return (severity, html_message, pending_acks), where pending_acks lists
+    the display names of critical subjects the user hasn't acknowledged yet
+    (acknowledged ones are marked 🔕 in the message instead)."""
     wallet_delegations = wallet_delegations or {}
     current_block, block_timestamp, _, all_reputations, all_heartbeats, authorities, active_bidders, all_versions, _, _, _ = api_data
 
@@ -625,10 +632,11 @@ def build_status_message_for_user(conn, chat_id, api_data, operator_validators, 
     )
 
     if not operator_validators:
-        return 'ok', f'{e("ok")} You have no operators registered. Use /register &lt;operator&gt; to add one.'
+        return 'ok', f'{e("ok")} You have no operators registered. Use /register &lt;operator&gt; to add one.', []
 
     all_operator_severities = []
     sections = []
+    pending_acks = []
 
     for operator, validators in operator_validators.items():
         val_lines = []
@@ -648,6 +656,14 @@ def build_status_message_for_user(conn, chat_id, api_data, operator_validators, 
                 severity = compute_validator_severity(row)
             else:
                 severity = 'ok' if online else 'critical'
+
+            ack_tail = ''
+            if row and (row['alert_offline'] or row['alert_critical']):
+                if ((row['alert_offline'] and not row['ack_offline'])
+                        or (row['alert_critical'] and not row['ack_critical'])):
+                    pending_acks.append(name)
+                else:
+                    ack_tail = ' 🔕'
 
             version = all_versions.get(validator, (0, 0, 0))
             outdated = version != (0, 0, 0) and version < max_version
@@ -673,17 +689,23 @@ def build_status_message_for_user(conn, chat_id, api_data, operator_validators, 
             ver_tail = f', CFE {_version_str(version)}'
             if outdated:
                 ver_tail += ' <i>(outdated)</i>'
-            val_lines.append(f'    {e(severity)} {role}{link} (rep: {rep}{trend_tail}{ver_tail})')
+            val_lines.append(f'    {e(severity)} {role}{link}{ack_tail} (rep: {rep}{trend_tail}{ver_tail})')
 
         op_severity = worst(*val_severities) if val_severities else 'ok'
 
         op_row = conn.execute(
-            'SELECT alert_alert_agg, alert_critical_agg FROM operator_state WHERE chat_id=? AND operator=?',
+            'SELECT alert_alert_agg, alert_critical_agg, ack_critical_agg FROM operator_state WHERE chat_id=? AND operator=?',
             (chat_id, operator)
         ).fetchone()
+        agg_ack_tail = ''
         if op_row:
             if op_row['alert_critical_agg']:
                 op_severity = worst(op_severity, 'critical')
+                if op_row['ack_critical_agg']:
+                    agg_ack_tail = ' 🔕'
+                else:
+                    op_name = vanity_map.get(operator) or short_addr(operator)
+                    pending_acks.append(f'{op_name} aggregate')
             elif op_row['alert_alert_agg']:
                 op_severity = worst(op_severity, 'alert')
 
@@ -705,7 +727,7 @@ def build_status_message_for_user(conn, chat_id, api_data, operator_validators, 
         for raw, label, current, upcoming, reward in wallet_delegations.get(operator, []):
             fin_lines.append(format_wallet_line(raw, label, current, upcoming, reward))
         sections.append(
-            f'{e(op_severity)} {op_link(operator, vanity_map)}\n' +
+            f'{e(op_severity)} {op_link(operator, vanity_map)}{agg_ack_tail}\n' +
             '\n'.join(fin_lines) + '\n' +
             '\n'.join(val_lines)
         )
@@ -713,7 +735,7 @@ def build_status_message_for_user(conn, chat_id, api_data, operator_validators, 
     global_severity = worst(*all_operator_severities) if all_operator_severities else 'ok'
     body = '\n\n'.join(sections)
     msg = f'{e(global_severity)} <b>Chainflip Validator Status</b> (block {current_block}, {relative_time(block_timestamp)})\n\n{body}'
-    return global_severity, msg
+    return global_severity, msg, pending_acks
 
 # ── Monitor loop ──────────────────────────────────────────────────────────────
 
@@ -1137,6 +1159,32 @@ async def callback_ack_aggregate(update: Update, context: ContextTypes.DEFAULT_T
     conn.commit()
     await query.answer('Acknowledged — reminders silenced until state changes')
 
+async def callback_ack_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Acknowledge every currently-critical condition in this chat. The button
+    label lists the subjects that were pending when /status was built; anything
+    that went critical since is swept up too, which is harmless — acks only
+    silence reminders, never the initial alert."""
+    conn = context.bot_data['conn']
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    cur = conn.execute('''
+        UPDATE validator_state
+        SET ack_offline  = alert_offline,
+            ack_critical = alert_critical
+        WHERE chat_id=? AND ((alert_offline AND NOT ack_offline)
+                             OR (alert_critical AND NOT ack_critical))
+    ''', (chat_id,))
+    acked = cur.rowcount
+    cur = conn.execute('''
+        UPDATE operator_state
+        SET ack_critical_agg = alert_critical_agg
+        WHERE chat_id=? AND alert_critical_agg AND NOT ack_critical_agg
+    ''', (chat_id,))
+    acked += cur.rowcount
+    conn.commit()
+    await query.answer(f'Acknowledged {acked} — reminders silenced until state changes')
+    await query.edit_message_reply_markup(reply_markup=None)
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn    = context.bot_data['conn']
     api     = context.bot_data['api']
@@ -1176,11 +1224,22 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             None, get_wallet_delegations, api, wallet_pairs, list(operator_validators.keys())
         )
 
-        _, msg = build_status_message_for_user(
+        _, msg, pending_acks = build_status_message_for_user(
             conn, chat_id, api_data, operator_validators, vanity_map, operator_financials,
             wallet_delegations,
         )
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        reply_markup = None
+        if pending_acks:
+            # Keep the button label from growing unbounded with the watch list.
+            names = pending_acks[:ACK_BUTTON_NAMES]
+            if len(pending_acks) > ACK_BUTTON_NAMES:
+                names.append(f'+{len(pending_acks) - ACK_BUTTON_NAMES} more')
+            reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(
+                f'🔕 Ack {", ".join(names)}', callback_data='ackall',
+            )]])
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML,
+                                        disable_web_page_preview=True,
+                                        reply_markup=reply_markup)
 
     except Exception as ex:
         log.error(f'Status error: {ex}', exc_info=True)
@@ -1243,6 +1302,7 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_unwallet,       pattern='^unwal:'))
     app.add_handler(CallbackQueryHandler(callback_ack_validator,  pattern='^ackv:'))
     app.add_handler(CallbackQueryHandler(callback_ack_aggregate,  pattern='^ackop:'))
+    app.add_handler(CallbackQueryHandler(callback_ack_all,        pattern='^ackall$'))
 
     async def post_init(app):
         await app.bot.set_my_commands([
