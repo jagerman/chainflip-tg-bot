@@ -122,7 +122,7 @@ The `/status` command shows for each operator:
 ## Network display
 
 The `/network` command needs no registration and shows chain-wide state:
-- Epoch number, phase (regular epoch / auction phase / rotating), and how far through the epoch we are
+- Epoch number, phase (pre-auction / auction phase / rotating) with progress through that phase, and progress through the epoch as a whole — the two differ, since the auction phase only occupies the tail of the epoch
 - The bid accepted at this epoch's auction, and the projected MAB if the next auction resolved now
 - Online/total count of the epoch's authorities
 - Reputation breakdown across the authorities: the average, plus a count in each band (2500+, 1000–2499, 0–999, −2820–−1, and −2880–−2821 for dead/long-offline nodes pinned at the floor), using the same thresholds as the alerts, so the counts add up to the authority total

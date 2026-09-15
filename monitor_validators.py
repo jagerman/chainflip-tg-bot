@@ -434,8 +434,10 @@ def fetch_network_data(api):
     # whereas Validator::Bond is the bid accepted for the current epoch.
     epoch_state = api.rpc_request('cf_monitoring_epoch_state', [])['result']
     # True for the whole redemption-restricted tail of the epoch, not just while
-    # a rotation is actually running.
+    # a rotation is actually running. Taken from the chain rather than derived
+    # from the percentage below, which only tells us where that tail starts.
     in_auction = bool(api.rpc_request('cf_is_auction_phase', [])['result'])
+    auction_state = api.rpc_request('cf_auction_state', [])['result']
 
     authorities = list(api.query('Validator', 'CurrentAuthorities').value or [])
     heartbeats = {
@@ -462,6 +464,7 @@ def fetch_network_data(api):
         'epoch_duration':   epoch_state['epoch_duration'],
         'rotation_phase':   _rotation_phase_name(epoch_state['rotation_phase']),
         'in_auction':       in_auction,
+        'redemption_period_pct': auction_state['redemption_period_as_percentage'],
         'bond':             api.query('Validator', 'Bond').value or 0,
         'projected_mab':    int(epoch_state['min_active_bid'], 16),
         'authorities':      authorities,
@@ -834,17 +837,42 @@ def build_network_message(data):
     online = sum(1 for v in authorities
                  if is_online(v, data['current_block'], data['heartbeats']))
 
-    if data['rotation_phase'] != 'Idle':
-        phase = f'🔄 rotating — {data["rotation_phase"]}'
-    elif data['in_auction']:
-        phase = '🔨 auction phase'
-    else:
-        phase = '⏳ regular epoch'
-
     elapsed = data['current_block'] - data['epoch_started_at']
     duration = data['epoch_duration']
     remaining = max(duration - elapsed, 0)
     pct = 100 * elapsed / duration if duration else 0
+
+    # The auction phase occupies the tail of the epoch, beginning once
+    # redemption_period_as_percentage of it has elapsed. Progress through the
+    # epoch and progress through the current phase are quite different numbers,
+    # so report the phase's own alongside its name.
+    auction_start = duration * data['redemption_period_pct'] // 100
+    phase_pct = None
+    if 0 < auction_start < duration:
+        if data['in_auction'] and elapsed >= auction_start:
+            phase_pct = 100 * (elapsed - auction_start) / (duration - auction_start)
+        elif not data['in_auction'] and elapsed < auction_start:
+            phase_pct = 100 * elapsed / auction_start
+    phase_tail = f' ({phase_pct:.0f}% through)' if phase_pct is not None else ''
+
+    def countdown(label, blocks):
+        return f'    ⏳ Time to {label}: {blocks} blocks (~{_fmt_age(blocks * BLOCK_SECONDS)})'
+
+    # Countdowns to the transitions still ahead in this epoch. Mid-rotation
+    # there is no scheduled next transition to count down to.
+    countdowns = []
+    if data['rotation_phase'] == 'Idle':
+        if not data['in_auction'] and elapsed < auction_start:
+            countdowns.append(countdown('auction', auction_start - elapsed))
+        countdowns.append(countdown('rotation', remaining))
+
+    if data['rotation_phase'] != 'Idle':
+        # A rotation has no fixed length, so there's no progress to report.
+        phase = f'🔄 rotating — {data["rotation_phase"]}'
+    elif data['in_auction']:
+        phase = f'📊 auction phase{phase_tail}'
+    else:
+        phase = f'🌴 pre-auction phase{phase_tail}'
 
     reps = [data['reputations'].get(v, 0) for v in authorities]
     avg = sum(reps) / len(reps) if reps else 0
@@ -862,7 +890,8 @@ def build_network_message(data):
         f'🌐 <b>Chainflip Network</b> (block {data["current_block"]}, {relative_time(data["block_timestamp"])})',
         '',
         f'<b>Epoch {data["epoch"]}</b> — {phase}',
-        f'    ⏱ {pct:.0f}% through, {remaining} blocks (~{_fmt_age(remaining * BLOCK_SECONDS)}) left',
+        f'    ⏱ {pct:.0f}% through epoch',
+        *countdowns,
         f'    💰 Accepted bid: {format_flip(data["bond"])} FLIP',
         f'    📈 Projected next MAB: {format_flip(data["projected_mab"])} FLIP',
         f'    {e("ok") if online == total else e("warning")} Authorities: {online}/{total} online',
