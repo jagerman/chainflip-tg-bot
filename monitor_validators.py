@@ -27,6 +27,7 @@ Telegram commands:
   /register <operator>    - Add an operator to your watch list
   /unregister             - Remove an operator from your watch list
   /status                 - Show current status of all monitored operators
+  /network                - Show global network statistics
 """
 
 import asyncio
@@ -35,6 +36,7 @@ import sqlite3
 import sys
 import time
 import tomllib
+from collections import Counter
 from pathlib import Path
 from eth_utils import is_address, to_checksum_address
 from substrateinterface import SubstrateInterface
@@ -50,6 +52,9 @@ log = logging.getLogger(__name__)
 # ── Constants ────────────────────────────────────────────────────────────────
 
 HEARTBEAT_BLOCK_INTERVAL = 150
+
+# State chain block time, used to turn a remaining-blocks count into a duration.
+BLOCK_SECONDS = 6
 
 # Reputation thresholds. Max is the cap a fully-healthy validator sits at.
 REP_MAX      = 2880
@@ -395,6 +400,61 @@ def get_wallet_delegations(api, wallets, operators):
 
     return out
 
+def _rotation_phase_name(phase):
+    """Normalise a rotation phase to its bare variant name. The monitoring RPC
+    already reports a plain string; a storage read gives 'Idle' or a
+    {variant: payload} dict."""
+    if isinstance(phase, dict):
+        return next(iter(phase), 'Unknown')
+    return str(phase)
+
+def fetch_network_data(api):
+    """Gather the global network stats shown by /network."""
+    current_block = api.get_block_number(api.get_chain_head())
+    block_timestamp = api.query('Timestamp', 'Now').value / 1000  # ms -> seconds
+
+    # One call for epoch index, epoch window, rotation phase and the projected
+    # MAB; `min_active_bid` here is the auction re-resolved against live bids,
+    # i.e. the cutoff the *next* epoch would have if it resolved right now,
+    # whereas Validator::Bond is the bid accepted for the current epoch.
+    epoch_state = api.rpc_request('cf_monitoring_epoch_state', [])['result']
+    # True for the whole redemption-restricted tail of the epoch, not just while
+    # a rotation is actually running.
+    in_auction = bool(api.rpc_request('cf_is_auction_phase', [])['result'])
+
+    authorities = list(api.query('Validator', 'CurrentAuthorities').value or [])
+    heartbeats = {
+        str(k): v.value
+        for k, v in api.query_map('Reputation', 'LastHeartbeat')
+    }
+    reputations = {
+        str(k): (v.value or {}).get('reputation_points', 0)
+        for k, v in api.query_map('Reputation', 'Reputations')
+    }
+    versions = {
+        str(k): _version_tuple(v.value)
+        for k, v in api.query_map('Validator', 'NodeCFEVersion')
+    }
+    runtime = api.query('System', 'LastRuntimeUpgrade').value or {}
+
+    return {
+        'current_block':    current_block,
+        'block_timestamp':  block_timestamp,
+        'epoch':            epoch_state['current_epoch_index'],
+        'epoch_started_at': epoch_state['current_epoch_started_at'],
+        'epoch_duration':   epoch_state['epoch_duration'],
+        'rotation_phase':   _rotation_phase_name(epoch_state['rotation_phase']),
+        'in_auction':       in_auction,
+        'bond':             api.query('Validator', 'Bond').value or 0,
+        'projected_mab':    int(epoch_state['min_active_bid'], 16),
+        'authorities':      authorities,
+        'heartbeats':       heartbeats,
+        'reputations':      reputations,
+        'versions':         versions,
+        'spec_name':        runtime.get('spec_name', '?'),
+        'spec_version':     runtime.get('spec_version', 0),
+    }
+
 def is_online(validator, current_block, all_heartbeats):
     last_hb = all_heartbeats.get(validator)
     if last_hb is None:
@@ -737,6 +797,54 @@ def build_status_message_for_user(conn, chat_id, api_data, operator_validators, 
     msg = f'{e(global_severity)} <b>Chainflip Validator Status</b> (block {current_block}, {relative_time(block_timestamp)})\n\n{body}'
     return global_severity, msg, pending_acks
 
+def build_network_message(data):
+    """Render the global network overview as an HTML message."""
+    authorities = data['authorities']
+    total = len(authorities)
+    online = sum(1 for v in authorities
+                 if is_online(v, data['current_block'], data['heartbeats']))
+
+    if data['rotation_phase'] != 'Idle':
+        phase = f'🔄 rotating — {data["rotation_phase"]}'
+    elif data['in_auction']:
+        phase = '🔨 auction phase'
+    else:
+        phase = '⏳ regular epoch'
+
+    elapsed = data['current_block'] - data['epoch_started_at']
+    duration = data['epoch_duration']
+    remaining = max(duration - elapsed, 0)
+    pct = 100 * elapsed / duration if duration else 0
+
+    reps = [data['reputations'].get(v, 0) for v in authorities]
+    avg = sum(reps) / len(reps) if reps else 0
+
+    lines = [
+        f'🌐 <b>Chainflip Network</b> (block {data["current_block"]}, {relative_time(data["block_timestamp"])})',
+        '',
+        f'<b>Epoch {data["epoch"]}</b> — {phase}',
+        f'    ⏱ {pct:.0f}% through, {remaining} blocks (~{_fmt_age(remaining * BLOCK_SECONDS)}) left',
+        f'    💰 Accepted bid: {format_flip(data["bond"])} FLIP',
+        f'    📈 Projected next MAB: {format_flip(data["projected_mab"])} FLIP',
+        f'    {e("ok") if online == total else e("warning")} Authorities: {online}/{total} online',
+        '',
+        f'<b>Reputation</b> (average {avg:.0f} of {REP_MAX})',
+        f'    {e("ok")} above {REP_WARNING}: {sum(1 for r in reps if r > REP_WARNING)}',
+        f'    {e("alert")} below {REP_ALERT}: {sum(1 for r in reps if r < REP_ALERT)}',
+        f'    {e("critical")} below {REP_CRITICAL}: {sum(1 for r in reps if r < REP_CRITICAL)}',
+        '',
+        '<b>CFE versions</b>',
+    ]
+
+    ver_counts = Counter(data['versions'].get(v, (0, 0, 0)) for v in authorities)
+    for version, count in sorted(ver_counts.items(), reverse=True):
+        share = 100 * count / total if total else 0
+        lines.append(f'    {_version_str(version)}: {count} ({share:.0f}%)')
+
+    lines.append('')
+    lines.append(f'<b>Runtime</b>: {data["spec_name"]} {data["spec_version"]}')
+    return '\n'.join(lines)
+
 # ── Monitor loop ──────────────────────────────────────────────────────────────
 
 async def monitor_loop(app, conn, api, poll_interval, reminder_interval):
@@ -943,7 +1051,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '/unregister — stop monitoring an operator\n'
         '/wallet &lt;0x… address&gt; [label] — register a delegator wallet to track\n'
         '/unwallet — remove a registered wallet\n'
-        '/status — show current validator status',
+        '/status — show current validator status\n'
+        '/network — show global network statistics',
         parse_mode=ParseMode.HTML,
     )
 
@@ -1245,6 +1354,19 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.error(f'Status error: {ex}', exc_info=True)
         await update.message.reply_text(f'⚠️ Error fetching status: {ex}')
 
+async def cmd_network(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    api = context.bot_data['api']
+
+    await update.message.reply_text('⏳ Fetching chain data...')
+
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(None, fetch_network_data, api)
+        await update.message.reply_text(build_network_message(data), parse_mode=ParseMode.HTML,
+                                        disable_web_page_preview=True)
+    except Exception as ex:
+        log.error(f'Network error: {ex}', exc_info=True)
+        await update.message.reply_text(f'⚠️ Error fetching network stats: {ex}')
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1294,6 +1416,7 @@ def main():
     app.add_handler(CommandHandler('wallet',     cmd_wallet))
     app.add_handler(CommandHandler('unwallet',   cmd_unwallet))
     app.add_handler(CommandHandler('status',     cmd_status))
+    app.add_handler(CommandHandler('network',    cmd_network))
     app.add_handler(MessageHandler(
         filters.REPLY & filters.TEXT & ~filters.COMMAND,
         handle_force_reply,
@@ -1307,6 +1430,7 @@ def main():
     async def post_init(app):
         await app.bot.set_my_commands([
             BotCommand('status',     'Show current status of monitored operators'),
+            BotCommand('network',    'Show global Chainflip network statistics'),
             BotCommand('register',   'Monitor a Chainflip operator (provide address)'),
             BotCommand('unregister', 'Stop monitoring an operator'),
             BotCommand('wallet',     'Track a delegator wallet (0x… address, optional label)'),

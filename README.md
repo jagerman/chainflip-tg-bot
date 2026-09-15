@@ -78,7 +78,10 @@ Config file defaults to `monitor_validators.toml` in the same directory as the s
 | `/start` | Welcome message and command list |
 | `/register <operator_address>` | Add an operator to your watch list |
 | `/unregister` | Remove an operator (shows clickable buttons) |
+| `/wallet <0x… address> [label]` | Track a delegator wallet |
+| `/unwallet` | Remove a tracked wallet (shows clickable buttons) |
 | `/status` | Show current status of all monitored operators |
+| `/network` | Show global network statistics |
 
 ## Alert Conditions
 
@@ -114,6 +117,16 @@ The `/status` command shows for each operator:
 - Per-validator list with severity indicator, link to validator page, and current reputation
 - Validators that are bidding but not yet authorities are marked with 🌱
 - Idle (non-bidding) validators are marked with 💤
+
+## Network display
+
+The `/network` command needs no registration and shows chain-wide state:
+- Epoch number, phase (regular epoch / auction phase / rotating), and how far through the epoch we are
+- The bid accepted at this epoch's auction, and the projected MAB if the next auction resolved now
+- Online/total count of the epoch's authorities
+- Reputation breakdown across the authorities: average, and counts above 2500, below 1000 and below 0 (the same thresholds the alerts use)
+- CFE versions in use, with a count and share for each
+- The node's runtime spec name and version
 
 ## Files
 

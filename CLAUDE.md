@@ -56,6 +56,11 @@ The monitor loop runs in an executor thread (via `run_in_executor`) because `sub
 - Validator balances and bonds are in `Flip::Account` → `{balance, bond}`
 - Delegations are in `Validator::DelegationChoice` (delegator → (operator, max_bid)); managed validators do not appear here
 - Block timestamps are in `Timestamp::Now` (milliseconds)
+- `Validator::Bond` is the bid accepted at the *current* epoch's auction; the `min_active_bid` returned by the `cf_monitoring_epoch_state` / `cf_auction_state` RPCs re-resolves the auction against live bids, i.e. the projected MAB for the *next* epoch (it matches `cf_monitoring_simulate_auction`'s `auction_outcome.bond`, which is far more expensive — it returns every operator's bids)
+- `cf_monitoring_epoch_state` returns epoch index, epoch duration, start block, rotation phase and projected MAB in one call
+- `Validator::CurrentRotationPhase` is `Idle` when no rotation is running, otherwise `KeygensInProgress`, `KeyHandoversInProgress`, `ActivatingKeys`, `NewKeysActivated` or `SessionRotating`
+- `cf_is_auction_phase` is true for the whole redemption-restricted tail of the epoch (`redemption_period_as_percentage`), not just while a rotation is actually running
+- State chain block time is 6s
 - Validator status pages are at `https://scan.chainflip.io/validators/<address>`
 - Operator status pages are at `https://scan.chainflip.io/operators/<address>`
 
