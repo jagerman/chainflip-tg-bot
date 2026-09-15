@@ -1352,7 +1352,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('You have no operators registered. Use /register &lt;operator&gt;.', parse_mode=ParseMode.HTML)
         return
 
-    await update.message.reply_text('⏳ Fetching chain data...')
+    placeholder = await update.message.reply_text('⏳ Fetching chain data...')
 
     try:
         api_data = await asyncio.get_event_loop().run_in_executor(None, fetch_chain_data, api)
@@ -1391,26 +1391,26 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(
                 f'🔕 Ack {", ".join(names)}', callback_data='ackall',
             )]])
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML,
-                                        disable_web_page_preview=True,
-                                        reply_markup=reply_markup)
+        await placeholder.edit_text(msg, parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True,
+                                    reply_markup=reply_markup)
 
     except Exception as ex:
         log.error(f'Status error: {ex}', exc_info=True)
-        await update.message.reply_text(f'⚠️ Error fetching status: {ex}')
+        await placeholder.edit_text(f'⚠️ Error fetching status: {ex}')
 
 async def cmd_network(update: Update, context: ContextTypes.DEFAULT_TYPE):
     api = context.bot_data['api']
 
-    await update.message.reply_text('⏳ Fetching chain data...')
+    placeholder = await update.message.reply_text('⏳ Fetching chain data...')
 
     try:
         data = await asyncio.get_event_loop().run_in_executor(None, fetch_network_data, api)
-        await update.message.reply_text(build_network_message(data), parse_mode=ParseMode.HTML,
-                                        disable_web_page_preview=True)
+        await placeholder.edit_text(build_network_message(data), parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True)
     except Exception as ex:
         log.error(f'Network error: {ex}', exc_info=True)
-        await update.message.reply_text(f'⚠️ Error fetching network stats: {ex}')
+        await placeholder.edit_text(f'⚠️ Error fetching network stats: {ex}')
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
