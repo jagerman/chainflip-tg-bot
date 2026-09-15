@@ -125,7 +125,7 @@ The `/network` command needs no registration and shows chain-wide state:
 - Epoch number, phase (regular epoch / auction phase / rotating), and how far through the epoch we are
 - The bid accepted at this epoch's auction, and the projected MAB if the next auction resolved now
 - Online/total count of the epoch's authorities
-- Reputation breakdown across the authorities: average, and counts above 2500, below 1000 and below 0 (the same thresholds the alerts use)
+- Reputation breakdown across the authorities: the average, plus a count in each band (2500+, 1000–2499, 0–999, −2820–−1, and −2880–−2821 for dead/long-offline nodes pinned at the floor), using the same thresholds as the alerts, so the counts add up to the authority total
 - CFE versions in use, with a count and share for each
 - The runtime version, in the same `X.Y.Z` form as the CFE versions
 
@@ -153,6 +153,7 @@ See `monitor_validators.toml.sample` for all options:
 | `emoji.alert` | Status indicator for alert | 🟠 |
 | `emoji.critical` | Status indicator for critical | 🔴 |
 | `emoji.recovery` | Prefix for alerts containing only recoveries | ✅ |
+| `emoji.dead` | `/network` reputation band for nodes at the floor | 💀 |
 
 ## RPC Endpoint Monitor (companion bot)
 

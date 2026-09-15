@@ -44,12 +44,13 @@ The monitor loop runs in an executor thread (via `run_in_executor`) because `sub
 - `[telegram]` — `bot_token`
 - `[database]` — `path` (optional, defaults to `monitor_validators.db` next to config)
 - `[monitoring]` — `poll_interval_seconds`, `reminder_interval_seconds`
-- `[emoji]` — `ok`, `warning`, `alert`, `critical` (status indicator characters), `recovery`
+- `[emoji]` — `ok`, `warning`, `alert`, `critical` (status indicator characters), `recovery`, `dead`
 
 ## Chainflip-specific details
 
 - Validator online status is determined by `Reputation::LastHeartbeat` — offline if current_block - last_heartbeat >= 150 (the `HEARTBEAT_BLOCK_INTERVAL`)
-- Reputation is an integer from -2880 to 2880 (`Reputation::Reputations` → `reputation_points`)
+- Reputation is an integer from -2880 to 2880 (`Reputation::Reputations` → `reputation_points`); the bounds are the `ReputationPointFloorAndCeiling` constant
+- Reputation is lost through many penalties, not just missed heartbeats — `cf_penalties` lists them (MissedHeartbeat 15, FailedLivenessCheck 15 *per external chain*, ParticipateSigningFailed / FailedToBroadcastTransaction / ParticipateKeygenFailed 60, GrandpaEquivocation 120, FailedToWitnessInTime and MissedAuthorshipSlot 1). An offline node accrues several of these at once, so it reaches the -2880 floor quickly and stays pinned there
 - Operator → validator mapping is in `Validator::ManagedValidators` (operator → BTreeSet<validator>)
 - Vanity names are in `AccountRoles::VanityNames` (StorageValue containing a list of (AccountId, name) tuples)
 - Chainflip addresses start with `cF` and are 49 characters (SS58 encoding)
@@ -63,8 +64,8 @@ The monitor loop runs in an executor thread (via `run_in_executor`) because `sub
 - `Validator::CurrentRotationPhase` is `Idle` when no rotation is running, otherwise `KeygensInProgress`, `KeyHandoversInProgress`, `ActivatingKeys`, `NewKeysActivated` or `SessionRotating`
 - `cf_is_auction_phase` is true for the whole redemption-restricted tail of the epoch (`redemption_period_as_percentage`), not just while a rotation is actually running
 - State chain block time is 6s
-- Validator status pages are at `https://scan.chainflip.io/validators/<address>`
 - The runtime `spec_version` (`System::LastRuntimeUpgrade`) packs two decimal digits per component, so 20213 means 2.2.13 — display it decoded, matching the CFE version format
+- Validator status pages are at `https://scan.chainflip.io/validators/<address>`
 - Operator status pages are at `https://scan.chainflip.io/operators/<address>`
 
 ## Style

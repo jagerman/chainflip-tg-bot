@@ -56,11 +56,19 @@ HEARTBEAT_BLOCK_INTERVAL = 150
 # State chain block time, used to turn a remaining-blocks count into a duration.
 BLOCK_SECONDS = 6
 
-# Reputation thresholds. Max is the cap a fully-healthy validator sits at.
+# Reputation thresholds. Max is the cap a fully-healthy validator sits at; the
+# chain's floor (ReputationPointFloorAndCeiling) is its mirror image.
 REP_MAX      = 2880
 REP_WARNING  = 2500
 REP_ALERT    = 1000
 REP_CRITICAL = 0
+REP_MIN      = -REP_MAX
+# A small tolerance above the floor. An offline node bleeds reputation from
+# many penalties at once — missed heartbeats, per-chain liveness checks, missed
+# witnessing and authorship — so it drops to the floor quickly and then sits
+# pinned there. Anything in this band is dead or long-offline rather than
+# merely misbehaving.
+REP_DEAD     = REP_MIN + 60
 
 # Consecutive-drop requirements per level
 DROPS_WARNING  = 4
@@ -78,8 +86,9 @@ SCAN_OPERATOR  = 'https://scan.chainflip.io/operators'
 CHAINFLIP_SS58_PREFIX = 2112
 
 # Severity levels in ascending order, plus the 'recovery' marker prefixed to
-# alerts that carry only good news — populated from config at startup
-EMOJI = {}  # ok / warning / alert / critical / recovery -> str
+# alerts that carry only good news and the 'dead' /network reputation band —
+# populated from config at startup
+EMOJI = {}  # ok / warning / alert / critical / recovery / dead -> str
 
 # Optional "quiet hours" window during which persistent-critical *reminders*
 # are suppressed (transition alerts still fire). Tuple of ((start_h, start_m),
@@ -299,6 +308,11 @@ def _version_str(t):
     """Render a (major, minor, patch) tuple as 'X.Y.Z' (or '?' if zero)."""
     return f'{t[0]}.{t[1]}.{t[2]}' if t != (0, 0, 0) else '?'
 
+def _spec_version_tuple(spec_version):
+    """Decode a runtime spec_version into (major, minor, patch). Chainflip packs
+    two decimal digits per component, so 20213 is 2.2.13."""
+    return (spec_version // 10000, spec_version // 100 % 100, spec_version % 100)
+
 def _fmt_age(seconds):
     """Format an age (seconds, may be float) compactly: '12s', '7.2m', '3.4h', '2.1d'."""
     if seconds < 60:
@@ -308,11 +322,6 @@ def _fmt_age(seconds):
     if seconds < 86400:
         return f'{seconds/3600:.1f}h'
     return f'{seconds/86400:.1f}d'
-def _spec_version_tuple(spec_version):
-    """Decode a runtime spec_version into (major, minor, patch). Chainflip packs
-    two decimal digits per component, so 20213 is 2.2.13."""
-    return (spec_version // 10000, spec_version // 100 % 100, spec_version % 100)
-
 
 FLIP_DECIMALS = 10**18
 
@@ -441,6 +450,8 @@ def fetch_network_data(api):
         str(k): _version_tuple(v.value)
         for k, v in api.query_map('Validator', 'NodeCFEVersion')
     }
+    # LastRuntimeUpgrade rather than the cached api.runtime_version, which would
+    # go stale on this long-lived connection if the chain upgraded under us.
     runtime = api.query('System', 'LastRuntimeUpgrade').value or {}
 
     return {
@@ -450,8 +461,6 @@ def fetch_network_data(api):
         'epoch_started_at': epoch_state['current_epoch_started_at'],
         'epoch_duration':   epoch_state['epoch_duration'],
         'rotation_phase':   _rotation_phase_name(epoch_state['rotation_phase']),
-    # LastRuntimeUpgrade rather than the cached api.runtime_version, which would
-    # go stale on this long-lived connection if the chain upgraded under us.
         'in_auction':       in_auction,
         'bond':             api.query('Validator', 'Bond').value or 0,
         'projected_mab':    int(epoch_state['min_active_bid'], 16),
@@ -804,6 +813,20 @@ def build_status_message_for_user(conn, chat_id, api_data, operator_validators, 
     msg = f'{e(global_severity)} <b>Chainflip Validator Status</b> (block {current_block}, {relative_time(block_timestamp)})\n\n{body}'
     return global_severity, msg, pending_acks
 
+def reputation_band(reputation):
+    """Bucket a reputation into a /network display band, using the same
+    thresholds (and the same `< threshold` convention) as the alerts. 'dead' is
+    a subdivision of critical, not a severity — don't feed it to worst()."""
+    if reputation < REP_DEAD:
+        return 'dead'
+    if reputation < REP_CRITICAL:
+        return 'critical'
+    if reputation < REP_ALERT:
+        return 'alert'
+    if reputation < REP_WARNING:
+        return 'warning'
+    return 'ok'
+
 def build_network_message(data):
     """Render the global network overview as an HTML message."""
     authorities = data['authorities']
@@ -825,6 +848,15 @@ def build_network_message(data):
 
     reps = [data['reputations'].get(v, 0) for v in authorities]
     avg = sum(reps) / len(reps) if reps else 0
+    rep_counts = Counter(reputation_band(r) for r in reps)
+    # Descending bands, labelled from the thresholds so the two stay in step.
+    rep_bands = [
+        ('ok',       f'{REP_WARNING}+'),
+        ('warning',  f'{REP_ALERT} to {REP_WARNING - 1}'),
+        ('alert',    f'{REP_CRITICAL} to {REP_ALERT - 1}'),
+        ('critical', f'{REP_DEAD} to {REP_CRITICAL - 1}'),
+        ('dead',     f'≤{REP_DEAD - 1}'),
+    ]
 
     lines = [
         f'🌐 <b>Chainflip Network</b> (block {data["current_block"]}, {relative_time(data["block_timestamp"])})',
@@ -836,9 +868,7 @@ def build_network_message(data):
         f'    {e("ok") if online == total else e("warning")} Authorities: {online}/{total} online',
         '',
         f'<b>Reputation</b> (average {avg:.0f} of {REP_MAX})',
-        f'    {e("ok")} above {REP_WARNING}: {sum(1 for r in reps if r > REP_WARNING)}',
-        f'    {e("alert")} below {REP_ALERT}: {sum(1 for r in reps if r < REP_ALERT)}',
-        f'    {e("critical")} below {REP_CRITICAL}: {sum(1 for r in reps if r < REP_CRITICAL)}',
+        *(f'    {e(band)} {label}: {rep_counts[band]}' for band, label in rep_bands),
         '',
         '<b>CFE versions</b>',
     ]
@@ -1404,6 +1434,7 @@ def main():
     EMOJI['alert']    = emoji_cfg.get('alert',    '🟠')
     EMOJI['critical'] = emoji_cfg.get('critical', '🔴')
     EMOJI['recovery'] = emoji_cfg.get('recovery', '✅')
+    EMOJI['dead']     = emoji_cfg.get('dead',     '💀')
 
     if not bot_token:
         print('Error: telegram.bot_token must be set in config.', file=sys.stderr)

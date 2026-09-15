@@ -22,3 +22,6 @@ critical = "🔴"
 # Prefixed to alerts that contain only recoveries, so good news is obvious even
 # when the overall severity is still red.
 recovery = "✅"
+# /network reputation band for validators pinned at (or just above) the -2880
+# reputation floor — i.e. dead or long-offline nodes.
+dead     = "💀"
