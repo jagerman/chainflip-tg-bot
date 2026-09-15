@@ -314,14 +314,18 @@ def _spec_version_tuple(spec_version):
     return (spec_version // 10000, spec_version // 100 % 100, spec_version % 100)
 
 def _fmt_age(seconds):
-    """Format an age (seconds, may be float) compactly: '12s', '7.2m', '3.4h', '2.1d'."""
-    if seconds < 60:
-        return f'{int(seconds)}s'
-    if seconds < 3600:
-        return f'{seconds/60:.1f}m'
-    if seconds < 86400:
-        return f'{seconds/3600:.1f}h'
-    return f'{seconds/86400:.1f}d'
+    """Format a duration (seconds, may be float) as '2d 6h', '18h 47m', '42m',
+    '9m 59s' or '45s', carrying the next unit down only where it still matters."""
+    seconds = int(seconds)
+    if seconds >= 86400:
+        return f'{seconds // 86400}d {seconds % 86400 // 3600}h'
+    if seconds >= 3600:
+        return f'{seconds // 3600}h {seconds % 3600 // 60}m'
+    if seconds >= 600:
+        return f'{seconds // 60}m'
+    if seconds >= 60:
+        return f'{seconds // 60}m {seconds % 60}s'
+    return f'{seconds}s'
 
 FLIP_DECIMALS = 10**18
 
