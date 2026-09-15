@@ -19,3 +19,6 @@ ok       = "🟢"
 warning  = "🟡"
 alert    = "🟠"
 critical = "🔴"
+# Prefixed to alerts that contain only recoveries, so good news is obvious even
+# when the overall severity is still red.
+recovery = "✅"

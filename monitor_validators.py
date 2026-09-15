@@ -77,8 +77,9 @@ SCAN_OPERATOR  = 'https://scan.chainflip.io/operators'
 # Chainflip SS58 prefix; ETH-derived accounts are 12 zero bytes + 20-byte address.
 CHAINFLIP_SS58_PREFIX = 2112
 
-# Severity levels in ascending order — populated from config at startup
-EMOJI = {}  # ok / warning / alert / critical -> str
+# Severity levels in ascending order, plus the 'recovery' marker prefixed to
+# alerts that carry only good news — populated from config at startup
+EMOJI = {}  # ok / warning / alert / critical / recovery -> str
 
 # Optional "quiet hours" window during which persistent-critical *reminders*
 # are suppressed (transition alerts still fire). Tuple of ((start_h, start_m),
@@ -90,9 +91,9 @@ SEVERITY_RANK = {'ok': 0, 'warning': 1, 'alert': 2, 'critical': 3}
 def worst(*severities):
     return max(severities, key=lambda s: SEVERITY_RANK[s])
 
-def e(severity):
-    """Return the emoji for a severity level."""
-    return EMOJI[severity]
+def e(key):
+    """Return the configured emoji for a severity level (or 'recovery')."""
+    return EMOJI[key]
 
 def relative_time(timestamp):
     """Format a unix timestamp as a relative time string."""
@@ -959,7 +960,15 @@ def run_poll(app, conn, api, reminder_interval):
         # poll just because they happened.
         _set_last_severity(conn, chat_id, operator, current_severity)
 
-        lines = [f'{e(global_severity)} <b>Chainflip Alert</b> — {op_link(operator, vanity_map)} (block {current_block}, {relative_time(block_timestamp)})\n']
+        # A message whose alerts are *all* recoveries still carries the overall
+        # severity, which can be critical because of some unrelated validator.
+        # Mark it so good news is distinguishable at a glance from a fresh
+        # failure; a message that also carries new bad news stays unmarked so
+        # the marker never softens it.
+        recovery = all(s == 'ok' for s, _, _, _ in chat_alerts)
+        prefix = e('recovery') if recovery else ''
+
+        lines = [f'{prefix}{e(global_severity)} <b>Chainflip Alert</b> — {op_link(operator, vanity_map)} (block {current_block}, {relative_time(block_timestamp)})\n']
 
         # Track critical-severity subjects so we can offer an ack button for
         # each; a single button per validator (acks both offline + rep-crit),
@@ -1388,6 +1397,7 @@ def main():
     EMOJI['warning']  = emoji_cfg.get('warning',  '🟡')
     EMOJI['alert']    = emoji_cfg.get('alert',    '🟠')
     EMOJI['critical'] = emoji_cfg.get('critical', '🔴')
+    EMOJI['recovery'] = emoji_cfg.get('recovery', '✅')
 
     if not bot_token:
         print('Error: telegram.bot_token must be set in config.', file=sys.stderr)

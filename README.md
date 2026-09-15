@@ -104,6 +104,7 @@ Config file defaults to `monitor_validators.toml` in the same directory as the s
 ### Alert behaviour
 
 - Alerts fire on state transitions (e.g. going offline, crossing a threshold).
+- An alert whose contents are *entirely* recoveries is prefixed with ✅ ahead of the overall severity indicator, e.g. `✅🔴` — something got better, but other validators are still critical. Mixed messages (a recovery plus a new failure) are not marked.
 - An "all good" message fires once when all conditions clear.
 - Critical conditions re-send reminder alerts every 2 hours (configurable).
 - Each Telegram user's monitoring state is independent.
@@ -151,6 +152,7 @@ See `monitor_validators.toml.sample` for all options:
 | `emoji.warning` | Status indicator for warning | 🟡 |
 | `emoji.alert` | Status indicator for alert | 🟠 |
 | `emoji.critical` | Status indicator for critical | 🔴 |
+| `emoji.recovery` | Prefix for alerts containing only recoveries | ✅ |
 
 ## RPC Endpoint Monitor (companion bot)
 

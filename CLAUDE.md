@@ -25,6 +25,8 @@ Single-file Python bot (`monitor_validators.py`) with two concurrent tasks:
 - `alert` — reputation dropping, below 1000 for 2+ consecutive polls; or >50% below 2500
 - `critical` — node offline; reputation below 0; or >50% below 1000
 
+An alert message carries the operator's *overall* severity in its header, so a recovery can arrive under a red dot when other validators are still failing. Messages whose alerts are all recoveries are therefore prefixed with `EMOJI['recovery']` (`✅🔴`); mixed messages are not, so the marker never softens fresh bad news.
+
 ### SQLite tables
 
 - `subscriptions(chat_id, operator)` — user watch list
@@ -42,7 +44,7 @@ The monitor loop runs in an executor thread (via `run_in_executor`) because `sub
 - `[telegram]` — `bot_token`
 - `[database]` — `path` (optional, defaults to `monitor_validators.db` next to config)
 - `[monitoring]` — `poll_interval_seconds`, `reminder_interval_seconds`
-- `[emoji]` — `ok`, `warning`, `alert`, `critical` (status indicator characters)
+- `[emoji]` — `ok`, `warning`, `alert`, `critical` (status indicator characters), `recovery`
 
 ## Chainflip-specific details
 
