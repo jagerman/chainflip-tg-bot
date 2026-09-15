@@ -127,7 +127,7 @@ The `/network` command needs no registration and shows chain-wide state:
 - Online/total count of the epoch's authorities
 - Reputation breakdown across the authorities: average, and counts above 2500, below 1000 and below 0 (the same thresholds the alerts use)
 - CFE versions in use, with a count and share for each
-- The node's runtime spec name and version
+- The runtime version, in the same `X.Y.Z` form as the CFE versions
 
 ## Files
 

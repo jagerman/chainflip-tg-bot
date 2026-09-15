@@ -64,6 +64,7 @@ The monitor loop runs in an executor thread (via `run_in_executor`) because `sub
 - `cf_is_auction_phase` is true for the whole redemption-restricted tail of the epoch (`redemption_period_as_percentage`), not just while a rotation is actually running
 - State chain block time is 6s
 - Validator status pages are at `https://scan.chainflip.io/validators/<address>`
+- The runtime `spec_version` (`System::LastRuntimeUpgrade`) packs two decimal digits per component, so 20213 means 2.2.13 — display it decoded, matching the CFE version format
 - Operator status pages are at `https://scan.chainflip.io/operators/<address>`
 
 ## Style

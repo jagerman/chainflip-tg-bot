@@ -308,6 +308,11 @@ def _fmt_age(seconds):
     if seconds < 86400:
         return f'{seconds/3600:.1f}h'
     return f'{seconds/86400:.1f}d'
+def _spec_version_tuple(spec_version):
+    """Decode a runtime spec_version into (major, minor, patch). Chainflip packs
+    two decimal digits per component, so 20213 is 2.2.13."""
+    return (spec_version // 10000, spec_version // 100 % 100, spec_version % 100)
+
 
 FLIP_DECIMALS = 10**18
 
@@ -445,6 +450,8 @@ def fetch_network_data(api):
         'epoch_started_at': epoch_state['current_epoch_started_at'],
         'epoch_duration':   epoch_state['epoch_duration'],
         'rotation_phase':   _rotation_phase_name(epoch_state['rotation_phase']),
+    # LastRuntimeUpgrade rather than the cached api.runtime_version, which would
+    # go stale on this long-lived connection if the chain upgraded under us.
         'in_auction':       in_auction,
         'bond':             api.query('Validator', 'Bond').value or 0,
         'projected_mab':    int(epoch_state['min_active_bid'], 16),
@@ -452,7 +459,6 @@ def fetch_network_data(api):
         'heartbeats':       heartbeats,
         'reputations':      reputations,
         'versions':         versions,
-        'spec_name':        runtime.get('spec_name', '?'),
         'spec_version':     runtime.get('spec_version', 0),
     }
 
@@ -843,7 +849,7 @@ def build_network_message(data):
         lines.append(f'    {_version_str(version)}: {count} ({share:.0f}%)')
 
     lines.append('')
-    lines.append(f'<b>Runtime</b>: {data["spec_name"]} {data["spec_version"]}')
+    lines.append(f'<b>Runtime</b>: {_version_str(_spec_version_tuple(data["spec_version"]))}')
     return '\n'.join(lines)
 
 # ── Monitor loop ──────────────────────────────────────────────────────────────
